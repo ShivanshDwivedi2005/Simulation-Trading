@@ -35,7 +35,6 @@ function HomeContent() {
   const [videoPaused, setVideoPaused] = useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [formError, setFormError] = useState("");
   const [verificationEmail, setVerificationEmail] = useState("");
-  const [developmentOtp, setDevelopmentOtp] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -55,7 +54,6 @@ function HomeContent() {
 
   function openAuth(mode: AuthMode) {
     setFormError("");
-    setDevelopmentOtp("");
     setSubmitting(false);
     setAuthMode(mode);
   }
@@ -115,12 +113,11 @@ function HomeContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const result = await response.json().catch(() => ({})) as SessionResponse & { message?: string; development_otp?: string };
+      const result = await response.json().catch(() => ({})) as SessionResponse & { message?: string };
       if (!response.ok) throw new Error(result.message ?? "The request could not be completed. Please try again.");
 
       if (authMode === "signup") {
         setVerificationEmail(email);
-        setDevelopmentOtp(result.development_otp ?? "");
         setAuthMode("verify");
         return;
       }
@@ -230,7 +227,6 @@ function HomeContent() {
               {authMode !== "verify" && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode === "login"} placeholder="you@example.com" /></label>}
               {authMode !== "verify" && <label>Password<input name="password" type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} placeholder="Minimum 8 characters" /></label>}
               {authMode === "verify" && <label>Verification code<input name="otp" inputMode="numeric" autoComplete="one-time-code" autoFocus maxLength={6} pattern="[0-9]{6}" placeholder="000000" /></label>}
-              {authMode === "verify" && developmentOtp && <p className="auth-dev-code">Development code: <strong>{developmentOtp}</strong></p>}
               {formError && <p className="auth-error" role="alert">{formError}</p>}
               <button className="auth-submit" type="submit" disabled={submitting}>{submitting ? "Please wait…" : authMode === "signup" ? "Create account" : authMode === "verify" ? "Verify and continue" : "Log in"}<ArrowRight aria-hidden="true" /></button>
             </form>

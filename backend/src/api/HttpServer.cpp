@@ -288,7 +288,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                              {{"status", ready ? "ready" : "degraded"},
                               {"services", {{"postgres", postgres_.status()}, {"redis", redis_.status()},
                                             {"alpaca", config_.alpaca_api_key_id.empty() ? "not_configured" : "configured"},
-                                            {"smtp", smtp_configured(config_) ? "configured" : "development_fallback"}}}});
+                                            {"smtp", smtp_configured(config_) ? "configured" : "not_configured"}}}});
       }
 
       if (request_.method() == http::verb::post && target == "/api/v1/auth/register") {
@@ -301,13 +301,13 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         }
         const auto otp = generate_otp();
         auto result = postgres_.register_user(name, email, password, otp, config_.otp_pepper, config_.otp_ttl_seconds);
-        const bool delivered = send_otp_email(config_, email, otp);
-        result["delivery"] = delivered ? "email" : "development_response";
-        result["message"] = delivered ? "Verification code sent." : "SMTP is not configured; use the development code returned by this response.";
-        if (config_.app_env == "development") result["development_otp"] = otp;
-        if (!delivered && config_.app_env != "development") {
-          return json_response(http::status::service_unavailable, {{"error", "otp_delivery_unavailable"}, {"message", "Email delivery is not configured."}});
+        if (!send_otp_email(config_, email, otp)) {
+          return json_response(http::status::service_unavailable,
+                               {{"error", "otp_delivery_unavailable"},
+                                {"message", "We could not send the verification email. Check the mail settings and try again."}});
         }
+        result["delivery"] = "email";
+        result["message"] = "Verification code sent.";
         return json_response(http::status::created, result);
       }
 
