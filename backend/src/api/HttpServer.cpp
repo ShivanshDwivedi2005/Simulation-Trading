@@ -316,9 +316,10 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const auto email = input.value("email", "");
         const auto otp = input.value("otp", "");
         if (!valid_email(email) || otp.size() != 6) return json_response(http::status::bad_request, {{"error", "invalid_otp_format"}});
-        const auto session = postgres_.verify_otp(email, otp, config_.otp_pepper, config_.access_token_ttl_seconds);
-        if (!session) return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_otp"}, {"message", "The verification code is incorrect, expired, or has too many failed attempts."}});
-        return json_response(http::status::ok, *session);
+        auto verification = postgres_.verify_otp(email, otp, config_.otp_pepper);
+        if (!verification) return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_otp"}, {"message", "The verification code is incorrect, expired, or has too many failed attempts."}});
+        (*verification)["message"] = "Email verified. Sign in to continue.";
+        return json_response(http::status::ok, *verification);
       }
 
       if (request_.method() == http::verb::post && target == "/api/v1/auth/login") {

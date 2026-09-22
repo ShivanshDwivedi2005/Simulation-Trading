@@ -19,8 +19,9 @@ import { FormEvent, Suspense, useEffect, useRef, useState } from "react";
 type AuthMode = "login" | "signup" | "verify";
 
 type SessionResponse = {
-  access_token: string;
-  user: { email: string; name: string };
+  access_token?: string;
+  user?: { email: string; name: string };
+  message?: string;
 };
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
@@ -34,7 +35,9 @@ function HomeContent() {
   const [authMode, setAuthMode] = useState<AuthMode | null>(() => searchParams.get("auth") === "login" ? "login" : null);
   const [videoPaused, setVideoPaused] = useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [formError, setFormError] = useState("");
+  const [formNotice, setFormNotice] = useState("");
   const [verificationEmail, setVerificationEmail] = useState("");
+  const [loginEmail, setLoginEmail] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -54,6 +57,7 @@ function HomeContent() {
 
   function openAuth(mode: AuthMode) {
     setFormError("");
+    setFormNotice("");
     setSubmitting(false);
     setAuthMode(mode);
   }
@@ -97,6 +101,7 @@ function HomeContent() {
 
     setSubmitting(true);
     setFormError("");
+    setFormNotice("");
     try {
       const endpoint = authMode === "signup"
         ? "/api/v1/auth/register"
@@ -113,13 +118,25 @@ function HomeContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      const result = await response.json().catch(() => ({})) as SessionResponse & { message?: string };
+      const result = await response.json().catch(() => ({})) as SessionResponse;
       if (!response.ok) throw new Error(result.message ?? "The request could not be completed. Please try again.");
 
       if (authMode === "signup") {
         setVerificationEmail(email);
         setAuthMode("verify");
         return;
+      }
+
+      if (authMode === "verify") {
+        setLoginEmail(email);
+        setVerificationEmail("");
+        setFormNotice(result.message ?? "Email verified. Sign in to continue.");
+        setAuthMode("login");
+        return;
+      }
+
+      if (!result.user || !result.access_token) {
+        throw new Error("The sign-in response was incomplete. Please try again.");
       }
 
       localStorage.setItem("simtrade_session", JSON.stringify({
@@ -222,13 +239,14 @@ function HomeContent() {
             <span className="auth-eyebrow">SIMTRADE ACCESS</span>
             <h2 id="auth-title">{authMode === "signup" ? "Create your trading profile" : authMode === "verify" ? "Verify your email" : "Welcome back"}</h2>
             <p>{authMode === "signup" ? "Start with a virtual portfolio and learn at your own pace." : authMode === "verify" ? `Enter the code sent to ${verificationEmail}.` : "Log in to continue to your simulated portfolio."}</p>
-            <form onSubmit={submitAuth} noValidate>
+            <form key={authMode} onSubmit={submitAuth} noValidate>
               {authMode === "signup" && <label>Full name<input name="fullName" autoComplete="name" autoFocus placeholder="Alex Morgan" /></label>}
-              {authMode !== "verify" && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode === "login"} placeholder="you@example.com" /></label>}
+              {authMode !== "verify" && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode === "login"} defaultValue={authMode === "login" ? loginEmail : ""} placeholder="you@example.com" /></label>}
               {authMode !== "verify" && <label>Password<input name="password" type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} placeholder="Minimum 8 characters" /></label>}
               {authMode === "verify" && <label>Verification code<input name="otp" inputMode="numeric" autoComplete="one-time-code" autoFocus maxLength={6} pattern="[0-9]{6}" placeholder="000000" /></label>}
+              {formNotice && <p className="auth-success" role="status">{formNotice}</p>}
               {formError && <p className="auth-error" role="alert">{formError}</p>}
-              <button className="auth-submit" type="submit" disabled={submitting}>{submitting ? "Please wait…" : authMode === "signup" ? "Create account" : authMode === "verify" ? "Verify and continue" : "Log in"}<ArrowRight aria-hidden="true" /></button>
+              <button className="auth-submit" type="submit" disabled={submitting}>{submitting ? "Please wait…" : authMode === "signup" ? "Create account" : authMode === "verify" ? "Verify email" : "Log in"}<ArrowRight aria-hidden="true" /></button>
             </form>
             {authMode === "verify" ? <p className="auth-switch">Wrong email? <button onClick={() => openAuth("signup")}>Start again</button></p> : <p className="auth-switch">{authMode === "signup" ? "Already have an account?" : "New to SimTrade?"} <button onClick={() => openAuth(authMode === "signup" ? "login" : "signup")}>{authMode === "signup" ? "Log in" : "Create one"}</button></p>}
             <small className="auth-disclaimer">Authentication is handled by the SimTrade API. Brokerage credentials are never requested.</small>

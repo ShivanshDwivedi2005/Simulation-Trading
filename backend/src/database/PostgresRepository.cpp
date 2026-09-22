@@ -122,8 +122,7 @@ nlohmann::json PostgresRepository::register_user(const std::string& name,
 
 std::optional<nlohmann::json> PostgresRepository::verify_otp(const std::string& email,
                                                             const std::string& otp,
-                                                            const std::string& otp_pepper,
-                                                            std::uint32_t access_token_ttl_seconds) {
+                                                            const std::string& otp_pepper) {
   std::scoped_lock lock(mutex_);
   if (!healthy()) throw std::runtime_error("database_unavailable");
 
@@ -159,13 +158,13 @@ std::optional<nlohmann::json> PostgresRepository::verify_otp(const std::string& 
   transaction.exec_params(
       "INSERT INTO trading_accounts (user_id) SELECT $1::uuid WHERE NOT EXISTS (SELECT 1 FROM trading_accounts WHERE user_id = $1::uuid)",
       user_id);
-  auto session = issue_session(transaction,
-                               user_id,
-                               users[0]["name"].as<std::string>(),
-                               users[0]["email"].as<std::string>(),
-                               access_token_ttl_seconds);
   transaction.commit();
-  return session;
+  return nlohmann::json{
+      {"verified", true},
+      {"user", {{"id", user_id},
+                {"name", users[0]["name"].as<std::string>()},
+                {"email", users[0]["email"].as<std::string>()}}},
+  };
 }
 
 std::optional<nlohmann::json> PostgresRepository::login(const std::string& email,
