@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  ArrowLeft,
   ArrowRight,
   BarChart3,
   Check,
@@ -11,7 +12,6 @@ import {
   Play,
   ShieldCheck,
   Sparkles,
-  X,
 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, Suspense, useEffect, useRef, useState } from "react";
@@ -32,7 +32,10 @@ function HomeContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const videoRef = useRef<HTMLVideoElement>(null);
-  const [authMode, setAuthMode] = useState<AuthMode | null>(() => searchParams.get("auth") === "login" ? "login" : null);
+  const authQuery = searchParams.get("auth");
+  const routeAuthMode: Exclude<AuthMode, "verify"> | null = authQuery === "login" || authQuery === "signup" ? authQuery : null;
+  const [authStep, setAuthStep] = useState<"verify" | null>(null);
+  const authMode: AuthMode | null = authStep ?? routeAuthMode;
   const [videoPaused, setVideoPaused] = useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [formError, setFormError] = useState("");
   const [formNotice, setFormNotice] = useState("");
@@ -46,20 +49,27 @@ function HomeContent() {
     }
   }, []);
 
-  useEffect(() => {
-    if (!authMode) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setAuthMode(null);
-    };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
-  }, [authMode]);
-
   function openAuth(mode: AuthMode) {
     setFormError("");
     setFormNotice("");
     setSubmitting(false);
-    setAuthMode(mode);
+    if (mode === "verify") {
+      setAuthStep("verify");
+      return;
+    }
+
+    setAuthStep(null);
+    const href = `/?auth=${mode}`;
+    if (authQuery === "login" || authQuery === "signup") {
+      router.replace(href, { scroll: false });
+    } else {
+      router.push(href, { scroll: false });
+    }
+  }
+
+  function returnHome() {
+    setAuthStep(null);
+    router.replace("/", { scroll: false });
   }
 
   function toggleVideo() {
@@ -123,7 +133,7 @@ function HomeContent() {
 
       if (authMode === "signup") {
         setVerificationEmail(email);
-        setAuthMode("verify");
+        setAuthStep("verify");
         return;
       }
 
@@ -131,7 +141,8 @@ function HomeContent() {
         setLoginEmail(email);
         setVerificationEmail("");
         setFormNotice(result.message ?? "Email verified. Sign in to continue.");
-        setAuthMode("login");
+        setAuthStep(null);
+        router.replace("/?auth=login", { scroll: false });
         return;
       }
 
@@ -144,7 +155,7 @@ function HomeContent() {
         name: result.user.name,
         token: result.access_token,
       }));
-      router.push("/portfolio");
+      router.replace("/portfolio");
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "Unable to reach the backend API.");
     } finally {
@@ -154,20 +165,20 @@ function HomeContent() {
 
   return (
     <main className="landing-shell">
-      <section className="landing-hero" aria-labelledby="hero-title">
-        <video
-          ref={videoRef}
-          className="landing-video"
-          src={VIDEO_URL}
-          autoPlay
-          muted
-          loop
-          playsInline
-          preload="metadata"
-          aria-hidden="true"
-        />
-        <div className="landing-scrim" aria-hidden="true" />
+      <video
+        ref={videoRef}
+        className="landing-video"
+        src={VIDEO_URL}
+        autoPlay
+        muted
+        loop
+        playsInline
+        preload="metadata"
+        aria-hidden="true"
+      />
+      <div className="landing-scrim" aria-hidden="true" />
 
+      <section className="landing-hero" aria-labelledby="hero-title">
         <header className="landing-nav">
           <a className="landing-brand" href="#top" aria-label="SimTrade home">
             <span className="brand-mark" aria-hidden="true"><Activity /></span>
@@ -232,9 +243,9 @@ function HomeContent() {
       <footer className="landing-footer"><span>© 2026 SimTrade</span><span>Simulation only · No real funds are used</span></footer>
 
       {authMode && (
-        <div className="auth-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setAuthMode(null)}>
+        <div className="auth-overlay">
           <section className="auth-dialog" role="dialog" aria-modal="true" aria-labelledby="auth-title">
-            <button className="auth-close" onClick={() => setAuthMode(null)} aria-label="Close authentication dialog"><X aria-hidden="true" /></button>
+            <button className="auth-back" onClick={returnHome}><ArrowLeft aria-hidden="true" /> Back to home</button>
             <div className="auth-icon" aria-hidden="true"><LockKeyhole /></div>
             <span className="auth-eyebrow">SIMTRADE ACCESS</span>
             <h2 id="auth-title">{authMode === "signup" ? "Create your trading profile" : authMode === "verify" ? "Verify your email" : "Welcome back"}</h2>
