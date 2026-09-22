@@ -1,0 +1,16 @@
+node_modules
+.git
+.next
+dist
+.wrangler
+.agents
+.vscode
+coverage
+*.log
+.env
+.env.*
+README.md
+backend/README.md
+documentation
+design-system
+drizzle
