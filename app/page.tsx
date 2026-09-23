@@ -16,13 +16,14 @@ import {
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, Suspense, useEffect, useRef, useState } from "react";
 
-type AuthMode = "login" | "signup" | "verify" | "forgot" | "reset";
+type AuthMode = "login" | "signup" | "verify" | "reset";
 type RoutedAuthMode = "login" | "signup";
 type AuthStep = Exclude<AuthMode, RoutedAuthMode>;
 
 type SessionResponse = {
   access_token?: string;
   user?: { email: string; name: string };
+  error?: string;
   message?: string;
 };
 
@@ -44,6 +45,7 @@ function HomeContent() {
   const [verificationEmail, setVerificationEmail] = useState("");
   const [resetEmail, setResetEmail] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
+  const [signupEmail, setSignupEmail] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
@@ -87,6 +89,43 @@ function HomeContent() {
     }
   }
 
+  async function requestPasswordReset(rawEmail: string) {
+    const email = rawEmail.trim();
+    if (!email.includes("@")) {
+      setFormError("Enter your account email before requesting a reset code.");
+      return;
+    }
+
+    setSubmitting(true);
+    setFormError("");
+    setFormNotice("");
+    try {
+      const response = await fetch(`${API_URL}/api/v1/auth/password-reset/request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email }),
+      });
+      const result = await response.json().catch(() => ({})) as SessionResponse;
+
+      if (response.status === 404 && result.error === "account_not_found") {
+        setSignupEmail(email);
+        setFormNotice(result.message ?? "No account exists with this email. Create an account first.");
+        setAuthStep(null);
+        router.replace("/?auth=signup", { scroll: false });
+        return;
+      }
+      if (!response.ok) throw new Error(result.message ?? "The reset code could not be sent. Please try again.");
+
+      setResetEmail(email);
+      setFormNotice(result.message ?? "Password reset code sent. Check your email.");
+      setAuthStep("reset");
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Unable to reach the backend API.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!authMode) return;
@@ -115,7 +154,7 @@ function HomeContent() {
       setFormError("Password must be at least 8 characters.");
       return;
     }
-    if (authMode === "reset" && password !== confirmPassword) {
+    if ((authMode === "signup" || authMode === "reset") && password !== confirmPassword) {
       setFormError("Passwords do not match.");
       return;
     }
@@ -132,18 +171,15 @@ function HomeContent() {
         signup: "/api/v1/auth/register",
         verify: "/api/v1/auth/verify-otp",
         login: "/api/v1/auth/login",
-        forgot: "/api/v1/auth/password-reset/request",
         reset: "/api/v1/auth/password-reset/confirm",
       }[authMode];
       const body = authMode === "signup"
         ? { name: fullName, email, password }
         : authMode === "verify"
           ? { email, otp }
-          : authMode === "forgot"
-            ? { email }
-            : authMode === "reset"
-              ? { email, otp, new_password: password }
-              : { email, password };
+          : authMode === "reset"
+            ? { email, otp, new_password: password }
+            : { email, password };
       const response = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -164,13 +200,6 @@ function HomeContent() {
         setFormNotice(result.message ?? "Email verified. Sign in to continue.");
         setAuthStep(null);
         router.replace("/?auth=login", { scroll: false });
-        return;
-      }
-
-      if (authMode === "forgot") {
-        setResetEmail(email);
-        setFormNotice(result.message ?? "If an active account exists for that email, a password reset code has been sent.");
-        setAuthStep("reset");
         return;
       }
 
@@ -289,21 +318,20 @@ function HomeContent() {
               signup: "Create your trading profile",
               verify: "Verify your email",
               login: "Welcome back",
-              forgot: "Reset your password",
               reset: "Enter your reset code",
             }[authMode]}</h2>
             <p>{{
               signup: "Start with a virtual portfolio and learn at your own pace.",
               verify: `Enter the code sent to ${verificationEmail}.`,
               login: "Log in to continue to your simulated portfolio.",
-              forgot: "Enter your account email and we’ll send you a one-time reset code.",
               reset: `Use the code sent for ${resetEmail} and choose a new password.`,
             }[authMode]}</p>
             <form key={authMode} onSubmit={submitAuth} noValidate>
               {authMode === "signup" && <label>Full name<input name="fullName" autoComplete="name" autoFocus placeholder="Alex Morgan" /></label>}
-              {(authMode === "login" || authMode === "signup" || authMode === "forgot") && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode !== "signup"} defaultValue={authMode === "login" ? loginEmail : ""} placeholder="you@example.com" /></label>}
+              {(authMode === "login" || authMode === "signup") && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode === "login"} value={authMode === "login" ? loginEmail : signupEmail} onChange={(event) => authMode === "login" ? setLoginEmail(event.target.value) : setSignupEmail(event.target.value)} placeholder="you@example.com" /></label>}
               {(authMode === "login" || authMode === "signup") && <label>Password<input name="password" type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} placeholder="Minimum 8 characters" /></label>}
-              {authMode === "login" && <button className="auth-forgot" type="button" onClick={() => openAuth("forgot")}>Forgot password?</button>}
+              {authMode === "signup" && <label>Confirm password<input name="confirmPassword" type="password" autoComplete="new-password" placeholder="Re-enter your password" /></label>}
+              {authMode === "login" && <button className="auth-forgot" type="button" disabled={submitting} onClick={() => void requestPasswordReset(loginEmail)}>{submitting ? "Checking account…" : "Forgot password?"}</button>}
               {authMode === "verify" && <label>Verification code<input name="otp" inputMode="numeric" autoComplete="one-time-code" autoFocus maxLength={6} pattern="[0-9]{6}" placeholder="000000" /></label>}
               {authMode === "reset" && <>
                 <label>Reset code<input name="otp" inputMode="numeric" autoComplete="one-time-code" autoFocus maxLength={6} pattern="[0-9]{6}" placeholder="000000" /></label>
@@ -316,13 +344,11 @@ function HomeContent() {
                 signup: "Create account",
                 verify: "Verify email",
                 login: "Log in",
-                forgot: "Send reset code",
                 reset: "Reset password",
               }[authMode]}<ArrowRight aria-hidden="true" /></button>
             </form>
             {authMode === "verify" && <p className="auth-switch">Wrong email? <button onClick={() => openAuth("signup")}>Start again</button></p>}
-            {authMode === "forgot" && <p className="auth-switch">Remembered your password? <button onClick={() => openAuth("login")}>Log in</button></p>}
-            {authMode === "reset" && <p className="auth-switch">Need a new code? <button onClick={() => openAuth("forgot")}>Send another</button></p>}
+            {authMode === "reset" && <p className="auth-switch">Need a new code? <button disabled={submitting} onClick={() => void requestPasswordReset(resetEmail)}>Send another</button></p>}
             {(authMode === "login" || authMode === "signup") && <p className="auth-switch">{authMode === "signup" ? "Already have an account?" : "New to SimTrade?"} <button onClick={() => openAuth(authMode === "signup" ? "login" : "signup")}>{authMode === "signup" ? "Log in" : "Create one"}</button></p>}
             <small className="auth-disclaimer">Authentication is handled by the SimTrade API. Brokerage credentials are never requested.</small>
           </section>

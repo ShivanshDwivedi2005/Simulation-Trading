@@ -341,23 +341,23 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
           return json_response(http::status::bad_request,
                                {{"error", "invalid_email"}, {"message", "Enter a valid email address."}});
         }
-        if (!smtp_configured(config_)) {
-          return json_response(http::status::service_unavailable,
-                               {{"error", "otp_delivery_unavailable"},
-                                {"message", "Password reset email is temporarily unavailable. Please try again later."}});
-        }
-
         const auto otp = generate_otp();
         const auto challenge = postgres_.create_password_reset(
             email, otp, config_.otp_pepper, config_.otp_ttl_seconds);
-        if (challenge && !send_otp_email(config_, (*challenge)["email"].get<std::string>(), otp, "RESET_PASSWORD")) {
+        if (!challenge) {
+          return json_response(http::status::not_found,
+                               {{"error", "account_not_found"},
+                                {"message", "No account exists with this email. Create an account first."}});
+        }
+        if (!smtp_configured(config_) ||
+            !send_otp_email(config_, (*challenge)["email"].get<std::string>(), otp, "RESET_PASSWORD")) {
           return json_response(http::status::service_unavailable,
                                {{"error", "otp_delivery_unavailable"},
                                 {"message", "Password reset email is temporarily unavailable. Please try again later."}});
         }
 
         return json_response(http::status::accepted,
-                             {{"message", "If an active account exists for that email, a password reset code has been sent."}});
+                             {{"message", "Password reset code sent. Check your email."}});
       }
 
       if (request_.method() == http::verb::post && target == "/api/v1/auth/password-reset/confirm") {
