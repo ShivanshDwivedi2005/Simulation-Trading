@@ -16,7 +16,9 @@ import {
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, Suspense, useEffect, useRef, useState } from "react";
 
-type AuthMode = "login" | "signup" | "verify";
+type AuthMode = "login" | "signup" | "verify" | "forgot" | "reset";
+type RoutedAuthMode = "login" | "signup";
+type AuthStep = Exclude<AuthMode, RoutedAuthMode>;
 
 type SessionResponse = {
   access_token?: string;
@@ -33,13 +35,14 @@ function HomeContent() {
   const searchParams = useSearchParams();
   const videoRef = useRef<HTMLVideoElement>(null);
   const authQuery = searchParams.get("auth");
-  const routeAuthMode: Exclude<AuthMode, "verify"> | null = authQuery === "login" || authQuery === "signup" ? authQuery : null;
-  const [authStep, setAuthStep] = useState<"verify" | null>(null);
+  const routeAuthMode: RoutedAuthMode | null = authQuery === "login" || authQuery === "signup" ? authQuery : null;
+  const [authStep, setAuthStep] = useState<AuthStep | null>(null);
   const authMode: AuthMode | null = authStep ?? routeAuthMode;
   const [videoPaused, setVideoPaused] = useState(() => typeof window !== "undefined" && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
   const [formError, setFormError] = useState("");
   const [formNotice, setFormNotice] = useState("");
   const [verificationEmail, setVerificationEmail] = useState("");
+  const [resetEmail, setResetEmail] = useState("");
   const [loginEmail, setLoginEmail] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
@@ -53,8 +56,8 @@ function HomeContent() {
     setFormError("");
     setFormNotice("");
     setSubmitting(false);
-    if (mode === "verify") {
-      setAuthStep("verify");
+    if (mode !== "login" && mode !== "signup") {
+      setAuthStep(mode);
       return;
     }
 
@@ -86,9 +89,17 @@ function HomeContent() {
 
   async function submitAuth(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (!authMode) return;
     const data = new FormData(event.currentTarget);
-    const email = authMode === "verify" ? verificationEmail : String(data.get("email") ?? "").trim();
-    const password = String(data.get("password") ?? "");
+    const email = authMode === "verify"
+      ? verificationEmail
+      : authMode === "reset"
+        ? resetEmail
+        : String(data.get("email") ?? "").trim();
+    const password = authMode === "reset"
+      ? String(data.get("newPassword") ?? "")
+      : String(data.get("password") ?? "");
+    const confirmPassword = String(data.get("confirmPassword") ?? "");
     const fullName = String(data.get("fullName") ?? "").trim();
     const otp = String(data.get("otp") ?? "").trim();
 
@@ -96,12 +107,16 @@ function HomeContent() {
       setFormError("Enter a valid email address.");
       return;
     }
-    if (authMode === "verify" && !/^\d{6}$/.test(otp)) {
-      setFormError("Enter the 6-digit verification code.");
+    if ((authMode === "verify" || authMode === "reset") && !/^\d{6}$/.test(otp)) {
+      setFormError("Enter the 6-digit code.");
       return;
     }
-    if (authMode !== "verify" && password.length < 8) {
+    if ((authMode === "login" || authMode === "signup" || authMode === "reset") && password.length < 8) {
       setFormError("Password must be at least 8 characters.");
+      return;
+    }
+    if (authMode === "reset" && password !== confirmPassword) {
+      setFormError("Passwords do not match.");
       return;
     }
     if (authMode === "signup" && fullName.length < 2) {
@@ -113,16 +128,22 @@ function HomeContent() {
     setFormError("");
     setFormNotice("");
     try {
-      const endpoint = authMode === "signup"
-        ? "/api/v1/auth/register"
-        : authMode === "verify"
-          ? "/api/v1/auth/verify-otp"
-          : "/api/v1/auth/login";
+      const endpoint = {
+        signup: "/api/v1/auth/register",
+        verify: "/api/v1/auth/verify-otp",
+        login: "/api/v1/auth/login",
+        forgot: "/api/v1/auth/password-reset/request",
+        reset: "/api/v1/auth/password-reset/confirm",
+      }[authMode];
       const body = authMode === "signup"
         ? { name: fullName, email, password }
         : authMode === "verify"
           ? { email, otp }
-          : { email, password };
+          : authMode === "forgot"
+            ? { email }
+            : authMode === "reset"
+              ? { email, otp, new_password: password }
+              : { email, password };
       const response = await fetch(`${API_URL}${endpoint}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -141,6 +162,22 @@ function HomeContent() {
         setLoginEmail(email);
         setVerificationEmail("");
         setFormNotice(result.message ?? "Email verified. Sign in to continue.");
+        setAuthStep(null);
+        router.replace("/?auth=login", { scroll: false });
+        return;
+      }
+
+      if (authMode === "forgot") {
+        setResetEmail(email);
+        setFormNotice(result.message ?? "If an active account exists for that email, a password reset code has been sent.");
+        setAuthStep("reset");
+        return;
+      }
+
+      if (authMode === "reset") {
+        setLoginEmail(email);
+        setResetEmail("");
+        setFormNotice(result.message ?? "Password reset successfully. Sign in with your new password.");
         setAuthStep(null);
         router.replace("/?auth=login", { scroll: false });
         return;
@@ -248,18 +285,45 @@ function HomeContent() {
             <button className="auth-back" onClick={returnHome}><ArrowLeft aria-hidden="true" /> Back to home</button>
             <div className="auth-icon" aria-hidden="true"><LockKeyhole /></div>
             <span className="auth-eyebrow">SIMTRADE ACCESS</span>
-            <h2 id="auth-title">{authMode === "signup" ? "Create your trading profile" : authMode === "verify" ? "Verify your email" : "Welcome back"}</h2>
-            <p>{authMode === "signup" ? "Start with a virtual portfolio and learn at your own pace." : authMode === "verify" ? `Enter the code sent to ${verificationEmail}.` : "Log in to continue to your simulated portfolio."}</p>
+            <h2 id="auth-title">{{
+              signup: "Create your trading profile",
+              verify: "Verify your email",
+              login: "Welcome back",
+              forgot: "Reset your password",
+              reset: "Enter your reset code",
+            }[authMode]}</h2>
+            <p>{{
+              signup: "Start with a virtual portfolio and learn at your own pace.",
+              verify: `Enter the code sent to ${verificationEmail}.`,
+              login: "Log in to continue to your simulated portfolio.",
+              forgot: "Enter your account email and we’ll send you a one-time reset code.",
+              reset: `Use the code sent for ${resetEmail} and choose a new password.`,
+            }[authMode]}</p>
             <form key={authMode} onSubmit={submitAuth} noValidate>
               {authMode === "signup" && <label>Full name<input name="fullName" autoComplete="name" autoFocus placeholder="Alex Morgan" /></label>}
-              {authMode !== "verify" && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode === "login"} defaultValue={authMode === "login" ? loginEmail : ""} placeholder="you@example.com" /></label>}
-              {authMode !== "verify" && <label>Password<input name="password" type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} placeholder="Minimum 8 characters" /></label>}
+              {(authMode === "login" || authMode === "signup" || authMode === "forgot") && <label>Email address<input name="email" type="email" autoComplete="email" autoFocus={authMode !== "signup"} defaultValue={authMode === "login" ? loginEmail : ""} placeholder="you@example.com" /></label>}
+              {(authMode === "login" || authMode === "signup") && <label>Password<input name="password" type="password" autoComplete={authMode === "signup" ? "new-password" : "current-password"} placeholder="Minimum 8 characters" /></label>}
+              {authMode === "login" && <button className="auth-forgot" type="button" onClick={() => openAuth("forgot")}>Forgot password?</button>}
               {authMode === "verify" && <label>Verification code<input name="otp" inputMode="numeric" autoComplete="one-time-code" autoFocus maxLength={6} pattern="[0-9]{6}" placeholder="000000" /></label>}
+              {authMode === "reset" && <>
+                <label>Reset code<input name="otp" inputMode="numeric" autoComplete="one-time-code" autoFocus maxLength={6} pattern="[0-9]{6}" placeholder="000000" /></label>
+                <label>New password<input name="newPassword" type="password" autoComplete="new-password" placeholder="Minimum 8 characters" /></label>
+                <label>Confirm new password<input name="confirmPassword" type="password" autoComplete="new-password" placeholder="Re-enter your password" /></label>
+              </>}
               {formNotice && <p className="auth-success" role="status">{formNotice}</p>}
               {formError && <p className="auth-error" role="alert">{formError}</p>}
-              <button className="auth-submit" type="submit" disabled={submitting}>{submitting ? "Please wait…" : authMode === "signup" ? "Create account" : authMode === "verify" ? "Verify email" : "Log in"}<ArrowRight aria-hidden="true" /></button>
+              <button className="auth-submit" type="submit" disabled={submitting}>{submitting ? "Please wait…" : {
+                signup: "Create account",
+                verify: "Verify email",
+                login: "Log in",
+                forgot: "Send reset code",
+                reset: "Reset password",
+              }[authMode]}<ArrowRight aria-hidden="true" /></button>
             </form>
-            {authMode === "verify" ? <p className="auth-switch">Wrong email? <button onClick={() => openAuth("signup")}>Start again</button></p> : <p className="auth-switch">{authMode === "signup" ? "Already have an account?" : "New to SimTrade?"} <button onClick={() => openAuth(authMode === "signup" ? "login" : "signup")}>{authMode === "signup" ? "Log in" : "Create one"}</button></p>}
+            {authMode === "verify" && <p className="auth-switch">Wrong email? <button onClick={() => openAuth("signup")}>Start again</button></p>}
+            {authMode === "forgot" && <p className="auth-switch">Remembered your password? <button onClick={() => openAuth("login")}>Log in</button></p>}
+            {authMode === "reset" && <p className="auth-switch">Need a new code? <button onClick={() => openAuth("forgot")}>Send another</button></p>}
+            {(authMode === "login" || authMode === "signup") && <p className="auth-switch">{authMode === "signup" ? "Already have an account?" : "New to SimTrade?"} <button onClick={() => openAuth(authMode === "signup" ? "login" : "signup")}>{authMode === "signup" ? "Log in" : "Create one"}</button></p>}
             <small className="auth-disclaimer">Authentication is handled by the SimTrade API. Brokerage credentials are never requested.</small>
           </section>
         </div>

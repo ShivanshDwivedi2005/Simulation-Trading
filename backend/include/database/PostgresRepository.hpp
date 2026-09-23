@@ -28,6 +28,14 @@ class PostgresRepository {
   [[nodiscard]] std::optional<nlohmann::json> verify_otp(const std::string& email,
                                                         const std::string& otp,
                                                         const std::string& otp_pepper);
+  [[nodiscard]] std::optional<nlohmann::json> create_password_reset(const std::string& email,
+                                                                   const std::string& otp,
+                                                                   const std::string& otp_pepper,
+                                                                   std::uint32_t otp_ttl_seconds);
+  [[nodiscard]] bool reset_password(const std::string& email,
+                                    const std::string& otp,
+                                    const std::string& new_password,
+                                    const std::string& otp_pepper);
   [[nodiscard]] std::optional<nlohmann::json> login(const std::string& email,
                                                    const std::string& password,
                                                    std::uint32_t access_token_ttl_seconds);

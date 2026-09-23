@@ -167,6 +167,89 @@ std::optional<nlohmann::json> PostgresRepository::verify_otp(const std::string& 
   };
 }
 
+std::optional<nlohmann::json> PostgresRepository::create_password_reset(const std::string& email,
+                                                                        const std::string& otp,
+                                                                        const std::string& otp_pepper,
+                                                                        std::uint32_t otp_ttl_seconds) {
+  std::scoped_lock lock(mutex_);
+  if (!healthy()) throw std::runtime_error("database_unavailable");
+
+  pqxx::work transaction(*connection_);
+  const auto users = transaction.exec_params(
+      "SELECT user_id::text, email FROM users "
+      "WHERE lower(email) = lower($1) AND status = 'ACTIVE' AND email_verified_at IS NOT NULL FOR UPDATE",
+      email);
+  if (users.empty()) return std::nullopt;
+
+  const auto user_id = users[0]["user_id"].as<std::string>();
+  transaction.exec_params(
+      "UPDATE otp_challenges SET consumed_at = now() "
+      "WHERE user_id = $1::uuid AND purpose = 'RESET_PASSWORD' AND consumed_at IS NULL",
+      user_id);
+  const auto challenge = transaction.exec_params(
+      "INSERT INTO otp_challenges (user_id, purpose, otp_hash, expires_at) "
+      "VALUES ($1::uuid, 'RESET_PASSWORD', encode(digest($2, 'sha256'), 'hex'), now() + ($3 * interval '1 second')) "
+      "RETURNING challenge_id::text, expires_at",
+      user_id,
+      otp + otp_pepper,
+      otp_ttl_seconds);
+  transaction.commit();
+
+  return nlohmann::json{
+      {"challenge_id", challenge[0]["challenge_id"].as<std::string>()},
+      {"email", users[0]["email"].as<std::string>()},
+      {"expires_at", challenge[0]["expires_at"].as<std::string>()},
+  };
+}
+
+bool PostgresRepository::reset_password(const std::string& email,
+                                        const std::string& otp,
+                                        const std::string& new_password,
+                                        const std::string& otp_pepper) {
+  std::scoped_lock lock(mutex_);
+  if (!healthy()) throw std::runtime_error("database_unavailable");
+
+  pqxx::work transaction(*connection_);
+  const auto users = transaction.exec_params(
+      "SELECT user_id::text FROM users "
+      "WHERE lower(email) = lower($1) AND status = 'ACTIVE' AND email_verified_at IS NOT NULL FOR UPDATE",
+      email);
+  if (users.empty()) return false;
+
+  const auto user_id = users[0]["user_id"].as<std::string>();
+  const auto challenges = transaction.exec_params(
+      "SELECT challenge_id::text, expires_at > now() AS unexpired, attempt_count, "
+      "otp_hash = encode(digest($2, 'sha256'), 'hex') AS matches "
+      "FROM otp_challenges WHERE user_id = $1::uuid AND purpose = 'RESET_PASSWORD' AND consumed_at IS NULL "
+      "ORDER BY created_at DESC LIMIT 1 FOR UPDATE",
+      user_id,
+      otp + otp_pepper);
+  if (challenges.empty()) return false;
+
+  const auto challenge_id = challenges[0]["challenge_id"].as<std::string>();
+  const auto attempt_count = challenges[0]["attempt_count"].as<int>();
+  const bool valid = challenges[0]["unexpired"].as<bool>() && challenges[0]["matches"].as<bool>() && attempt_count < 5;
+  if (!valid) {
+    transaction.exec_params(
+        "UPDATE otp_challenges SET attempt_count = attempt_count + 1 WHERE challenge_id = $1::uuid",
+        challenge_id);
+    transaction.commit();
+    return false;
+  }
+
+  transaction.exec_params(
+      "UPDATE user_credentials SET password_hash = crypt($2, gen_salt('bf', 12)), "
+      "password_algorithm = 'bcrypt', password_changed_at = now() WHERE user_id = $1::uuid",
+      user_id,
+      new_password);
+  transaction.exec_params("UPDATE otp_challenges SET consumed_at = now() WHERE challenge_id = $1::uuid", challenge_id);
+  transaction.exec_params(
+      "UPDATE refresh_tokens SET revoked_at = now() WHERE user_id = $1::uuid AND revoked_at IS NULL",
+      user_id);
+  transaction.commit();
+  return true;
+}
+
 std::optional<nlohmann::json> PostgresRepository::login(const std::string& email,
                                                        const std::string& password,
                                                        std::uint32_t access_token_ttl_seconds) {

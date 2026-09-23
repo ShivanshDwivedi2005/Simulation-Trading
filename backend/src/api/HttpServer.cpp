@@ -137,17 +137,22 @@ bool smtp_configured(const simtrade::config::Config& config) {
 
 bool send_otp_email(const simtrade::config::Config& config,
                     const std::string& recipient,
-                    const std::string& otp) {
+                    const std::string& otp,
+                    const std::string& purpose) {
   if (!smtp_configured(config)) return false;
   CURL* curl = curl_easy_init();
   if (curl == nullptr) return false;
 
+  const bool password_reset = purpose == "RESET_PASSWORD";
+  const auto subject = password_reset ? "Reset your SimTrade password" : "Your SimTrade verification code";
+  const auto description = password_reset ? "password reset code" : "verification code";
+
   UploadBuffer upload{
       "To: <" + recipient + ">\r\n"
       "From: " + config.smtp_from + "\r\n"
-      "Subject: Your SimTrade verification code\r\n"
+      "Subject: " + subject + "\r\n"
       "Content-Type: text/plain; charset=utf-8\r\n\r\n"
-      "Your SimTrade verification code is " + otp + ".\r\n"
+      "Your SimTrade " + description + " is " + otp + ".\r\n"
       "It expires in " + std::to_string(config.otp_ttl_seconds / 60) + " minutes.\r\n"
       "If you did not request this code, you can ignore this email.\r\n"};
   const auto smtp_url = "smtp://" + config.smtp_host + ":" + std::to_string(config.smtp_port);
@@ -301,7 +306,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         }
         const auto otp = generate_otp();
         auto result = postgres_.register_user(name, email, password, otp, config_.otp_pepper, config_.otp_ttl_seconds);
-        if (!send_otp_email(config_, email, otp)) {
+        if (!send_otp_email(config_, email, otp, "VERIFY_EMAIL")) {
           return json_response(http::status::service_unavailable,
                                {{"error", "otp_delivery_unavailable"},
                                 {"message", "We could not send the verification email. Check the mail settings and try again."}});
@@ -327,6 +332,53 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const auto session = postgres_.login(input.value("email", ""), input.value("password", ""), config_.access_token_ttl_seconds);
         if (!session) return json_response(http::status::unauthorized, {{"error", "invalid_credentials"}, {"message", "Email or password is incorrect, or the email has not been verified."}});
         return json_response(http::status::ok, *session);
+      }
+
+      if (request_.method() == http::verb::post && target == "/api/v1/auth/password-reset/request") {
+        const auto input = nlohmann::json::parse(request_.body());
+        const auto email = input.value("email", "");
+        if (!valid_email(email)) {
+          return json_response(http::status::bad_request,
+                               {{"error", "invalid_email"}, {"message", "Enter a valid email address."}});
+        }
+        if (!smtp_configured(config_)) {
+          return json_response(http::status::service_unavailable,
+                               {{"error", "otp_delivery_unavailable"},
+                                {"message", "Password reset email is temporarily unavailable. Please try again later."}});
+        }
+
+        const auto otp = generate_otp();
+        const auto challenge = postgres_.create_password_reset(
+            email, otp, config_.otp_pepper, config_.otp_ttl_seconds);
+        if (challenge && !send_otp_email(config_, (*challenge)["email"].get<std::string>(), otp, "RESET_PASSWORD")) {
+          return json_response(http::status::service_unavailable,
+                               {{"error", "otp_delivery_unavailable"},
+                                {"message", "Password reset email is temporarily unavailable. Please try again later."}});
+        }
+
+        return json_response(http::status::accepted,
+                             {{"message", "If an active account exists for that email, a password reset code has been sent."}});
+      }
+
+      if (request_.method() == http::verb::post && target == "/api/v1/auth/password-reset/confirm") {
+        const auto input = nlohmann::json::parse(request_.body());
+        const auto email = input.value("email", "");
+        const auto otp = input.value("otp", "");
+        const auto new_password = input.value("new_password", "");
+        if (!valid_email(email) || otp.size() != 6 ||
+            !std::all_of(otp.begin(), otp.end(), [](unsigned char character) { return std::isdigit(character); }) ||
+            new_password.size() < 8) {
+          return json_response(http::status::bad_request,
+                               {{"error", "invalid_password_reset"},
+                                {"message", "A valid email, 6-digit code, and password of at least 8 characters are required."}});
+        }
+        if (!postgres_.reset_password(email, otp, new_password, config_.otp_pepper)) {
+          return json_response(http::status::unauthorized,
+                               {{"error", "invalid_or_expired_otp"},
+                                {"message", "The reset code is incorrect, expired, or has too many failed attempts."}});
+        }
+        return json_response(http::status::ok,
+                             {{"message", "Password reset successfully. Sign in with your new password."}});
       }
 
       if (request_.method() == http::verb::get && target == "/api/v1/portfolio") {

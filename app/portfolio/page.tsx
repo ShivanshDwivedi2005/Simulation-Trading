@@ -36,6 +36,7 @@ export default function PortfolioPage() {
   }, [router, session, storedSession]);
 
   function signOut() {
+    if (!window.confirm("Do you want to log out?")) return;
     localStorage.removeItem("simtrade_session");
     router.replace("/");
   }
