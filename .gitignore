@@ -29,6 +29,7 @@ yarn-error.log*
 
 # environment files
 .env*
+!.env.example
 
 # vercel
 .vercel
@@ -43,7 +44,6 @@ next-env.d.ts
 # local reference material
 /README.md
 /backend/README.md
-/documentation/
 /design-system/
 /drizzle/
 # Checkout-local tool state; never publish it.

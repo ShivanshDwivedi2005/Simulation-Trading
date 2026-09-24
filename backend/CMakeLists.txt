@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(Boost 1.74 REQUIRED COMPONENTS system)
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 find_package(nlohmann_json 3.10 REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -19,6 +20,10 @@ add_executable(simtrade-api
   src/database/PostgresRepository.cpp
   src/cache/RedisClient.cpp
   src/execution/SimulationEngine.cpp
+  src/market/MarketDataCore.cpp
+  src/market/InstrumentCatalogue.cpp
+  src/market/AlpacaMarketDataStream.cpp
+  src/market/MarketDataHub.cpp
   src/api/HttpServer.cpp
 )
 
@@ -26,6 +31,8 @@ target_include_directories(simtrade-api PRIVATE include)
 target_link_libraries(simtrade-api PRIVATE
   Boost::system
   CURL::libcurl
+  OpenSSL::SSL
+  OpenSSL::Crypto
   nlohmann_json::nlohmann_json
   Threads::Threads
   PkgConfig::PQXX
@@ -37,3 +44,21 @@ target_compile_options(simtrade-api PRIVATE
 )
 
 install(TARGETS simtrade-api RUNTIME DESTINATION bin)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(simtrade-market-data-tests
+    tests/MarketDataTests.cpp
+    src/market/MarketDataCore.cpp
+    src/market/MarketDataHub.cpp
+  )
+  target_include_directories(simtrade-market-data-tests PRIVATE include)
+  target_link_libraries(simtrade-market-data-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    Threads::Threads
+  )
+  target_compile_options(simtrade-market-data-tests PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion>
+  )
+  add_test(NAME market-data-unit-tests COMMAND simtrade-market-data-tests)
+endif()

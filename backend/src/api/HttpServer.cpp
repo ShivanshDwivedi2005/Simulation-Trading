@@ -1,15 +1,20 @@
 #include "api/HttpServer.hpp"
 
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
+#include <boost/beast/websocket.hpp>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
+#include <deque>
 #include <iomanip>
+#include <map>
 #include <memory>
 #include <optional>
 #include <random>
@@ -21,6 +26,7 @@
 namespace {
 
 namespace http = boost::beast::http;
+namespace websocket = boost::beast::websocket;
 
 std::size_t append_response(char* data, std::size_t size, std::size_t count, void* target) {
   const auto bytes = size * count;
@@ -226,6 +232,59 @@ std::string allowed_cors_origin(const http::request<http::string_body>& request,
   return "";
 }
 
+std::string decode_query_component(const std::string& value) {
+  std::string decoded;
+  decoded.reserve(value.size());
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    if (value[index] == '+') {
+      decoded.push_back(' ');
+    } else if (value[index] == '%' && index + 2 < value.size()) {
+      const auto hex = value.substr(index + 1, 2);
+      char* end = nullptr;
+      const auto parsed = std::strtol(hex.c_str(), &end, 16);
+      if (end != nullptr && *end == '\0') {
+        decoded.push_back(static_cast<char>(parsed));
+        index += 2;
+      } else {
+        decoded.push_back(value[index]);
+      }
+    } else {
+      decoded.push_back(value[index]);
+    }
+  }
+  return decoded;
+}
+
+std::map<std::string, std::string> query_parameters(const std::string& target) {
+  std::map<std::string, std::string> parameters;
+  const auto question = target.find('?');
+  if (question == std::string::npos) return parameters;
+  std::size_t start = question + 1;
+  while (start <= target.size()) {
+    const auto ampersand = target.find('&', start);
+    const auto item = target.substr(start, ampersand == std::string::npos ? std::string::npos : ampersand - start);
+    const auto equals = item.find('=');
+    parameters[decode_query_component(item.substr(0, equals))] =
+        equals == std::string::npos ? "" : decode_query_component(item.substr(equals + 1));
+    if (ampersand == std::string::npos) break;
+    start = ampersand + 1;
+  }
+  return parameters;
+}
+
+std::size_t positive_query_number(const std::map<std::string, std::string>& parameters,
+                                  const std::string& name,
+                                  std::size_t fallback) {
+  const auto value = parameters.find(name);
+  if (value == parameters.end() || value->second.empty()) return fallback;
+  try {
+    const auto parsed = std::stoull(value->second);
+    return parsed == 0 ? fallback : static_cast<std::size_t>(parsed);
+  } catch (const std::exception&) {
+    return fallback;
+  }
+}
+
 }  // namespace
 
 namespace simtrade::api {
@@ -234,13 +293,96 @@ namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
+class FrontendWebSocketSession : public std::enable_shared_from_this<FrontendWebSocketSession> {
+ public:
+  FrontendWebSocketSession(beast::tcp_stream stream,
+                           http::request<http::string_body> request,
+                           market::MarketDataHub& hub)
+      : websocket_(std::move(stream)), request_(std::move(request)), hub_(hub) {}
+
+  ~FrontendWebSocketSession() { unregister(); }
+
+  void run() {
+    websocket_.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+    websocket_.set_option(websocket::stream_base::decorator([](websocket::response_type& response) {
+      response.set(http::field::server, "simtrade-market-data");
+    }));
+    websocket_.async_accept(request_, beast::bind_front_handler(&FrontendWebSocketSession::on_accept, shared_from_this()));
+  }
+
+ private:
+  void on_accept(beast::error_code error) {
+    if (error) return;
+    const std::weak_ptr<FrontendWebSocketSession> weak = shared_from_this();
+    client_id_ = hub_.add_client([weak](const std::string& message) {
+      if (const auto session = weak.lock()) session->deliver(message);
+    });
+    read();
+  }
+
+  void read() {
+    websocket_.async_read(buffer_, beast::bind_front_handler(&FrontendWebSocketSession::on_read, shared_from_this()));
+  }
+
+  void on_read(beast::error_code error, std::size_t) {
+    if (error) {
+      unregister();
+      return;
+    }
+    const auto message = beast::buffers_to_string(buffer_.data());
+    buffer_.consume(buffer_.size());
+    if (client_id_ != 0) hub_.handle_client_message(client_id_, message);
+    read();
+  }
+
+  void deliver(std::string message) {
+    net::post(websocket_.get_executor(), [self = shared_from_this(), message = std::move(message)]() mutable {
+      const bool writing = !self->outgoing_.empty();
+      self->outgoing_.push_back(std::move(message));
+      if (!writing) self->write();
+    });
+  }
+
+  void write() {
+    websocket_.text(true);
+    websocket_.async_write(net::buffer(outgoing_.front()),
+                           beast::bind_front_handler(&FrontendWebSocketSession::on_write, shared_from_this()));
+  }
+
+  void on_write(beast::error_code error, std::size_t) {
+    if (error) {
+      unregister();
+      return;
+    }
+    outgoing_.pop_front();
+    if (!outgoing_.empty()) write();
+  }
+
+  void unregister() {
+    if (client_id_ == 0) return;
+    hub_.remove_client(client_id_);
+    client_id_ = 0;
+  }
+
+  websocket::stream<beast::tcp_stream> websocket_;
+  http::request<http::string_body> request_;
+  beast::flat_buffer buffer_;
+  market::MarketDataHub& hub_;
+  market::MarketDataHub::ClientId client_id_{0};
+  std::deque<std::string> outgoing_;
+};
+
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
  public:
   HttpSession(tcp::socket socket,
               const config::Config& config,
               database::PostgresRepository& postgres,
-              const cache::RedisClient& redis)
-      : stream_(std::move(socket)), config_(config), postgres_(postgres), redis_(redis) {}
+              const cache::RedisClient& redis,
+              market::InstrumentCatalogue& catalogue,
+              market::AlpacaMarketDataStream& market_stream,
+              market::MarketDataHub& market_hub)
+      : stream_(std::move(socket)), config_(config), postgres_(postgres), redis_(redis),
+        catalogue_(catalogue), market_stream_(market_stream), market_hub_(market_hub) {}
 
   void run() { read(); }
 
@@ -253,6 +395,14 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   void on_read(beast::error_code error, std::size_t) {
     if (error == http::error::end_of_stream) return close();
     if (error) return;
+    if (websocket::is_upgrade(request_) && request_.target() == "/market") {
+      if (request_.find(http::field::origin) != request_.end() &&
+          allowed_cors_origin(request_, config_.cors_allowed_origins).empty()) {
+        return write(json_response(http::status::forbidden, {{"error", "websocket_origin_not_allowed"}}));
+      }
+      std::make_shared<FrontendWebSocketSession>(std::move(stream_), std::move(request_), market_hub_)->run();
+      return;
+    }
     write(route());
   }
 
@@ -332,6 +482,35 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const auto session = postgres_.login(input.value("email", ""), input.value("password", ""), config_.access_token_ttl_seconds);
         if (!session) return json_response(http::status::unauthorized, {{"error", "invalid_credentials"}, {"message", "Email or password is incorrect, or the email has not been verified."}});
         return json_response(http::status::ok, *session);
+      }
+
+      if (request_.method() == http::verb::get && target.rfind("/api/v1/instruments/search", 0) == 0) {
+        const auto parameters = query_parameters(target);
+        const auto query = parameters.contains("q") ? parameters.at("q") : "";
+        const auto page = positive_query_number(parameters, "page", 1);
+        const auto limit = positive_query_number(parameters, "limit", 20);
+        const auto result = catalogue_.search(query, page, limit);
+        nlohmann::json instruments = nlohmann::json::array();
+        for (const auto& instrument : result.instruments) instruments.push_back(market::instrument_to_json(instrument));
+        return json_response(http::status::ok,
+                             {{"instruments", instruments},
+                              {"pagination", {{"page", result.page}, {"limit", result.limit}, {"total", result.total}}},
+                              {"catalogueReady", catalogue_.ready()}});
+      }
+
+      if (request_.method() == http::verb::get && target == "/api/v1/market-data/health") {
+        const auto health = market_stream_.health();
+        return json_response(http::status::ok,
+                             {{"alpacaConnected", health.connected},
+                              {"feed", health.feed},
+                              {"subscribedSymbolCount", health.subscribed_symbol_count},
+                              {"maximumSymbolCount", health.maximum_symbol_count},
+                              {"instrumentCatalogueReady", catalogue_.ready()},
+                              {"instrumentCount", catalogue_.size()},
+                              {"instrumentCatalogueError", catalogue_.last_error().empty() ? nlohmann::json(nullptr) : nlohmann::json(catalogue_.last_error())},
+                              {"lastMessageAt", health.last_message_at.empty() ? nlohmann::json(nullptr) : nlohmann::json(health.last_message_at)},
+                              {"lastError", health.last_error.empty() ? nlohmann::json(nullptr) : nlohmann::json(health.last_error)},
+                              {"reconnectCount", health.reconnect_count}});
       }
 
       if (request_.method() == http::verb::post && target == "/api/v1/auth/password-reset/request") {
@@ -460,13 +639,20 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   const config::Config& config_;
   database::PostgresRepository& postgres_;
   const cache::RedisClient& redis_;
+  market::InstrumentCatalogue& catalogue_;
+  market::AlpacaMarketDataStream& market_stream_;
+  market::MarketDataHub& market_hub_;
 };
 
 HttpServer::HttpServer(net::io_context& io,
                        const config::Config& config,
                        database::PostgresRepository& postgres,
-                       const cache::RedisClient& redis)
-    : io_(io), config_(config), postgres_(postgres), redis_(redis), acceptor_(net::make_strand(io)) {
+                       const cache::RedisClient& redis,
+                       market::InstrumentCatalogue& catalogue,
+                       market::AlpacaMarketDataStream& market_stream,
+                       market::MarketDataHub& market_hub)
+    : io_(io), config_(config), postgres_(postgres), redis_(redis), catalogue_(catalogue),
+      market_stream_(market_stream), market_hub_(market_hub), acceptor_(net::make_strand(io)) {
   const auto address = net::ip::make_address(config.http_host);
   const tcp::endpoint endpoint{address, config.http_port};
   acceptor_.open(endpoint.protocol());
@@ -477,10 +663,17 @@ HttpServer::HttpServer(net::io_context& io,
 
 void HttpServer::run() { accept(); }
 
+void HttpServer::stop() {
+  beast::error_code error;
+  acceptor_.close(error);
+}
+
 void HttpServer::accept() {
   acceptor_.async_accept(net::make_strand(io_), [this](beast::error_code error, tcp::socket socket) {
-    if (!error) std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_)->run();
-    accept();
+    if (!error) {
+      std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_, catalogue_, market_stream_, market_hub_)->run();
+    }
+    if (acceptor_.is_open()) accept();
   });
 }
 

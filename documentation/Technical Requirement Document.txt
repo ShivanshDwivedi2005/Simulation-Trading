@@ -1,0 +1,87 @@
+SIMTRADE — TECHNICAL REQUIREMENT DOCUMENT
+Version: 0.1
+
+1. Architecture principles
+- C++ owns latency-sensitive APIs, WebSockets, validation, risk, execution, portfolio updates, and provider ingestion.
+- React/Next.js renders the terminal and never connects directly to Alpaca.
+- PostgreSQL is the authoritative persistent ledger.
+- Redis stores the latest normalized quotes, ephemeral sessions/cache, fan-out channels, and coordination state.
+- Services expose interfaces so the first modular monolith can later be separated without redesigning domain contracts.
+- Optimize measured hot paths; do not introduce Kafka, Kubernetes, TimescaleDB, or ClickHouse before profiling justifies them.
+
+2. Runtime topology
+Alpaca stream -> MarketDataProvider -> MarketDataService -> in-memory latest-price map + Redis -> internal event bus -> SimulationEngine and WebSocketGateway -> browsers.
+REST writes -> authentication -> order validation -> risk -> compliance observation -> simulation -> trade -> position -> portfolio -> PostgreSQL -> user event.
+
+3. Required stack
+- C++20, Boost.Asio, Boost.Beast, nlohmann/json.
+- libpqxx/PostgreSQL and hiredis/Redis.
+- React 19 / Next.js 16 application, TypeScript, SVG/Recharts-compatible chart layer.
+- CMake and Docker Compose.
+- Structured JSON logging and environment-only secrets.
+
+4. Backend modules
+- auth: AuthService, OAuthService, OTPService, TokenService.
+- users: UserService.
+- market: MarketDataProvider, AlpacaMarketDataProvider, MarketStream, InstrumentService, CandleService.
+- orders: OrderService, OrderValidator, StrategyOrderService.
+- execution: SimulationEngine, FillEngine, IcebergEngine.
+- portfolio: PortfolioService, PositionService, PnLService.
+- risk: RiskEngine and configurable RiskLimitRepository.
+- compliance: ComplianceEngine and ComplianceRuleEngine.
+- websocket: WebSocketServer and SubscriptionManager with backpressure.
+- database/cache/api: repositories, Redis client, and REST controllers.
+
+5. API contract (v1)
+Authentication: POST /auth/register, /auth/verify-otp, /auth/login, /auth/google, /auth/refresh, /auth/logout.
+Instruments: GET /instruments, /instruments/{symbol}, /instruments/search?q=.
+Market: GET /market/{symbol}/quote, /market/{symbol}/candles?interval=.
+Orders: POST /orders; GET /orders and /orders/{id}; DELETE /orders/{id}.
+Strategies: POST /strategies; GET /strategies and /strategies/{id}; DELETE /strategies/{id}.
+Portfolio: GET /portfolio, /positions, /trades, /performance.
+Compliance: GET /compliance/alerts.
+WebSocket: /market with subscribe/unsubscribe messages and server-side authorization/rate limits.
+
+6. Security
+- Hash passwords with Argon2id (preferred) using per-password salt and tuned memory/time cost.
+- Hash OTPs and refresh-token identifiers at rest; rotate refresh tokens and detect reuse.
+- Short-lived access tokens; secure, HttpOnly, SameSite cookies where deployment topology allows.
+- TLS in every non-local environment; strict origin allowlist; CSRF protection where cookies are used.
+- Validate request shape, bounds, enum values, symbol status, ownership, and idempotency keys.
+- Never log passwords, OTPs, tokens, OAuth codes, Alpaca secrets, or full personal data.
+- Rate-limit authentication, search, orders, and WebSocket subscription churn.
+
+7. Consistency and transactions
+- PostgreSQL is authoritative for balances, orders, fills, positions, and snapshots.
+- A fill and its cash/position effects commit in one database transaction.
+- Lock the trading-account/position rows or use optimistic versions to prevent double spend.
+- Every accepted order carries a client idempotency key unique per user.
+- Redis loss may degrade live display but must not corrupt the ledger.
+
+8. Performance targets for the initial release
+- p95 internal quote-normalization time below 2 ms under target load.
+- p95 internal market-order decision time below 5 ms excluding provider/network transit.
+- p95 authenticated REST response below 150 ms for non-streaming reads under normal load.
+- WebSocket backpressure with bounded per-connection queues; disconnect consistently slow consumers.
+- One upstream subscription per provider/symbol/feed combination, independent of viewer count.
+- Batch non-critical persistence and portfolio snapshots; never batch away ledger atomicity.
+
+9. Observability
+- Correlation ID across REST/WebSocket/order/fill flows.
+- Histograms for provider-to-ingest, ingest-to-engine, engine-to-gateway, and gateway-to-browser.
+- Counters for reconnects, dropped messages, order state transitions, rejects by rule, and reconciliation failures.
+- Health/readiness endpoints report PostgreSQL, Redis, market-stream, and event-loop state separately.
+
+10. Delivery phases
+Phase 1: project, Docker, PostgreSQL, Redis, config, logging, health.
+Phase 2: authentication and account creation.
+Phase 3: Alpaca normalization and 20–30 instruments.
+Phase 4: chart, search, watchlist, WebSocket updates.
+Phase 5–6: basic OMS, fills, positions, portfolio, P&L.
+Phase 7–9: iceberg/strategies, risk/compliance, execution realism.
+
+11. Current repository status
+- Functional browser vertical-slice prototype: instrument selection, chart modes/timeframes, market and resting-order behaviors, positions, cash, P&L, order cancellation, responsive layout.
+- Initial PostgreSQL schema and Docker topology are included.
+- C++ service scaffold provides configuration, dependency health, async HTTP, and simulation-domain seams.
+- Live Alpaca, production authentication, and authoritative persistence remain follow-on implementation, not browser-demo claims.

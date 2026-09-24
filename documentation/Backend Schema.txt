@@ -1,0 +1,50 @@
+SIMTRADE — BACKEND SCHEMA
+Version: 0.1
+Canonical migration: database/migrations/001_initial_schema.sql
+
+1. Identity
+users: profile, email, verification state, status, timestamps.
+user_credentials: one-to-one password hash and optional hash metadata. OAuth identities should move to a provider_identity table when multiple providers are supported.
+otp_challenges: hashed OTP, purpose, expiry, attempts, consumed timestamp.
+refresh_tokens: hashed token identifier, family, expiry, revocation, reuse metadata.
+
+2. Trading ledger
+trading_accounts: one or more accounts per user; currency, cash, reserved cash, status, optimistic version.
+orders: authoritative parent order including side/type/status, requested and remaining quantity, prices, iceberg quantities, idempotency key, timestamps.
+trades: immutable fills linked to order, account, user, and instrument.
+positions: one row per account/instrument with quantity, average price, realized P&L, version.
+portfolio_snapshots: time-series equity/cash/buying-power/P&L samples.
+
+3. Instruments and market reference
+instruments: canonical cross-asset representation—symbol, asset class, exchange, currency, tick/lot/contract size, optional expiry, provider/provider symbol, status, metadata.
+Market ticks and candles are not stored in the initial transactional database hot path. Latest values live in process memory/Redis. A time-series store can be introduced after retention/query needs are measured.
+
+4. Strategies
+strategy_orders: parent record with generalized strategy type and status.
+strategy_legs: ordered legs containing instrument, side, quantity, ratio, and optional target price. Outright, spread, butterfly, and double butterfly are compositions—not separate table designs.
+
+5. Risk and compliance
+risk_limits: account/user-scoped configurable limits and JSON extensions.
+compliance_alerts: rule, severity, description, related order, status, review fields. Alerts are surveillance/training signals, not legal determinations.
+
+6. Watchlists
+watchlists: user-owned named list.
+watchlist_items: ordered, unique instruments within a list.
+
+7. Important constraints
+- Monetary and quantity values use NUMERIC, never floating point.
+- Check constraints enforce enums and positive quantities/prices.
+- UNIQUE(user_id, client_order_id) provides request idempotency.
+- UNIQUE(account_id, instrument_id) prevents duplicate position rows.
+- Parent and ledger foreign keys use restrictive deletion; user-facing deletion is a status/anonymization workflow.
+
+8. Core indexes
+- orders(user_id, created_at desc), orders(account_id, status, created_at desc), orders(instrument_id, status).
+- trades(user_id, executed_at desc), trades(account_id, instrument_id, executed_at desc).
+- positions(account_id, instrument_id).
+- instruments(symbol), instruments(asset_class, status), instruments(provider, provider_symbol).
+- snapshots(account_id, captured_at desc).
+- alerts(user_id, status, created_at desc) and alerts(severity, status, created_at desc).
+
+9. Transaction boundary for a fill
+Lock/revalidate account and order -> insert trade -> update order remaining/status -> update cash/reserved cash -> upsert position and realized P&L -> append audit/outbox event -> commit. Publish only after commit; consumers recover from the outbox if publication fails.

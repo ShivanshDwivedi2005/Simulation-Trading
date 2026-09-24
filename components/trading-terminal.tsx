@@ -16,12 +16,13 @@ import {
   WalletCards,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-type SymbolKey = "AAPL" | "NVDA" | "MSFT" | "GOOGL" | "AMZN";
+type SymbolKey = string;
 type Candle = { time: string; open: number; high: number; low: number; close: number; volume: number };
 type Position = { symbol: SymbolKey; quantity: number; averagePrice: number };
-type Instrument = { name: string; price: number; change: number; bid: number; ask: number };
+type Instrument = { name: string; exchange: string; price: number; change: number; bid: number; ask: number };
+type CatalogueInstrument = { symbol: string; name: string; exchange: string; tradable: boolean; fractionable: boolean };
 type Order = {
   id: string;
   symbol: SymbolKey;
@@ -34,14 +35,15 @@ type Order = {
 };
 
 const fallbackInstruments: Record<SymbolKey, Instrument> = {
-  AAPL: { name: "Apple Inc.", price: 227.16, change: 1.42, bid: 227.14, ask: 227.18 },
-  NVDA: { name: "NVIDIA Corp.", price: 141.22, change: 2.84, bid: 141.2, ask: 141.25 },
-  MSFT: { name: "Microsoft Corp.", price: 515.73, change: -0.38, bid: 515.68, ask: 515.78 },
-  GOOGL: { name: "Alphabet Class A", price: 252.31, change: 0.76, bid: 252.27, ask: 252.35 },
-  AMZN: { name: "Amazon.com Inc.", price: 231.44, change: -1.12, bid: 231.4, ask: 231.48 },
+  AAPL: { name: "Apple Inc.", exchange: "NASDAQ", price: 227.16, change: 1.42, bid: 227.14, ask: 227.18 },
+  NVDA: { name: "NVIDIA Corp.", exchange: "NASDAQ", price: 141.22, change: 2.84, bid: 141.2, ask: 141.25 },
+  MSFT: { name: "Microsoft Corp.", exchange: "NASDAQ", price: 515.73, change: -0.38, bid: 515.68, ask: 515.78 },
+  GOOGL: { name: "Alphabet Class A", exchange: "NASDAQ", price: 252.31, change: 0.76, bid: 252.27, ask: 252.35 },
+  AMZN: { name: "Amazon.com Inc.", exchange: "NASDAQ", price: 231.44, change: -1.12, bid: 231.4, ask: 231.48 },
 };
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/market";
 
 const intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
 
@@ -73,11 +75,23 @@ const candleSets: Record<SymbolKey, Candle[]> = {
   AMZN: buildCandles(231.44, 23),
 };
 
+const dynamicCandleSets = new Map<string, Candle[]>();
+
+function candlesFor(symbol: string, price: number) {
+  if (candleSets[symbol]) return candleSets[symbol];
+  const existing = dynamicCandleSets.get(symbol);
+  if (existing) return existing;
+  const seed = Array.from(symbol).reduce((sum, character) => sum + character.charCodeAt(0), 0);
+  const candles = buildCandles(price > 0 ? price : 100, seed);
+  dynamicCandleSets.set(symbol, candles);
+  return candles;
+}
+
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
 function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; chartType: string; paused: boolean; price: number }) {
-  const candles = candleSets[symbol];
+  const candles = candlesFor(symbol, price);
   const width = 960;
   const height = 350;
   const pad = { top: 18, right: 64, bottom: 42, left: 16 };
@@ -168,15 +182,24 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   const [mobileWatchlist, setMobileWatchlist] = useState(false);
   const [instruments, setInstruments] = useState(fallbackInstruments);
   const [marketDataStatus, setMarketDataStatus] = useState("Connecting to Alpaca…");
+  const [instrumentQuery, setInstrumentQuery] = useState("AAPL · Apple Inc.");
+  const [searchResults, setSearchResults] = useState<CatalogueInstrument[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const subscribedSymbolRef = useRef(symbol);
+  const activeSymbolRef = useRef(symbol);
+  const pausedRef = useRef(paused);
   const displayedMarketDataStatus = paused ? "Quote updates paused" : marketDataStatus;
 
   const quote = instruments[symbol];
   const positionsValue = useMemo(
-    () => positions.reduce((sum, position) => sum + instruments[position.symbol].price * position.quantity, 0),
+    () => positions.reduce((sum, position) => sum + (instruments[position.symbol]?.price ?? position.averagePrice) * position.quantity, 0),
     [instruments, positions],
   );
   const unrealized = useMemo(
-    () => positions.reduce((sum, position) => sum + (instruments[position.symbol].price - position.averagePrice) * position.quantity, 0),
+    () => positions.reduce((sum, position) => sum + ((instruments[position.symbol]?.price ?? position.averagePrice) - position.averagePrice) * position.quantity, 0),
     [instruments, positions],
   );
   const equity = cash + positionsValue;
@@ -204,14 +227,26 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
         };
         if (!response.ok) throw new Error(result.error ?? "portfolio_request_failed");
         setCash(Number(result.cash ?? 0));
-        setPositions((result.positions ?? []).filter((item) => item.symbol in fallbackInstruments).map((item) => ({
-          symbol: item.symbol as SymbolKey,
+        const loadedPositions = result.positions ?? [];
+        const loadedOrders = result.orders ?? [];
+        setInstruments((current) => {
+          const next = { ...current };
+          for (const item of loadedPositions) {
+            if (!next[item.symbol]) next[item.symbol] = { name: item.symbol, exchange: "US", price: Number(item.average_price), change: 0, bid: Number(item.average_price), ask: Number(item.average_price) };
+          }
+          for (const item of loadedOrders) {
+            if (!next[item.symbol]) next[item.symbol] = { name: item.symbol, exchange: "US", price: Number(item.price), change: 0, bid: Number(item.price), ask: Number(item.price) };
+          }
+          return next;
+        });
+        setPositions(loadedPositions.map((item) => ({
+          symbol: item.symbol,
           quantity: Number(item.quantity),
           averagePrice: Number(item.average_price),
         })));
-        setOrders((result.orders ?? []).filter((item) => item.symbol in fallbackInstruments).map((item) => ({
+        setOrders(loadedOrders.map((item) => ({
           id: item.id.slice(0, 8).toUpperCase(),
-          symbol: item.symbol as SymbolKey,
+          symbol: item.symbol,
           side: item.side,
           type: item.type,
           quantity: Number(item.quantity),
@@ -229,9 +264,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   }, [accessToken]);
 
   useEffect(() => {
-    if (paused) return;
     const controller = new AbortController();
-    let intervalId = 0;
     async function loadQuote() {
       try {
         const response = await fetch(`${API_URL}/api/v1/market/${symbol}/quote`, { signal: controller.signal });
@@ -253,18 +286,160 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       }
     }
     void loadQuote();
-    intervalId = window.setInterval(loadQuote, 15_000);
+    return () => controller.abort();
+  }, [symbol]);
+
+  useEffect(() => {
+    const query = instrumentQuery.trim();
+    if (!searchOpen || query.length < 1 || query === `${symbol} · ${quote.name}`) {
+      return;
+    }
+    const controller = new AbortController();
+    const timeout = window.setTimeout(async () => {
+      try {
+        const response = await fetch(`${API_URL}/api/v1/instruments/search?q=${encodeURIComponent(query)}&page=1&limit=20`, {
+          signal: controller.signal,
+        });
+        const result = await response.json() as { instruments?: CatalogueInstrument[] };
+        if (!response.ok) throw new Error("instrument_search_failed");
+        setSearchResults(result.instruments ?? []);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setSearchResults([]);
+      } finally {
+        if (!controller.signal.aborted) setSearchLoading(false);
+      }
+    }, 220);
     return () => {
       controller.abort();
-      window.clearInterval(intervalId);
+      window.clearTimeout(timeout);
     };
+  }, [instrumentQuery, quote.name, searchOpen, symbol]);
+
+  useEffect(() => {
+    activeSymbolRef.current = symbol;
+    pausedRef.current = paused;
   }, [paused, symbol]);
+
+  useEffect(() => {
+    let stopped = false;
+    let reconnectTimer = 0;
+    let reconnectDelay = 1_000;
+
+    function connect() {
+      if (stopped) return;
+      const socket = new WebSocket(WS_URL);
+      socketRef.current = socket;
+      setMarketDataStatus("Connecting to Alpaca stream…");
+      socket.onopen = () => {
+        reconnectDelay = 1_000;
+        const currentSymbol = activeSymbolRef.current;
+        subscribedSymbolRef.current = currentSymbol;
+        socket.send(JSON.stringify({ action: "subscribe", symbols: [currentSymbol] }));
+        setMarketDataStatus("Alpaca IEX stream connected");
+      };
+      socket.onmessage = (message) => {
+        let event: {
+          type?: string;
+          symbol?: string;
+          bidPrice?: number;
+          askPrice?: number;
+          price?: number;
+          close?: number;
+          connected?: boolean;
+          message?: string;
+        };
+        try {
+          event = JSON.parse(String(message.data));
+        } catch {
+          return;
+        }
+        if (event.type === "error") {
+          setMarketDataStatus(event.message ?? "Market stream error");
+          return;
+        }
+        if (event.type === "status" && event.symbol === activeSymbolRef.current) {
+          setMarketDataStatus(event.connected ? "Alpaca IEX stream connected" : "Alpaca stream reconnecting…");
+          return;
+        }
+        if (pausedRef.current || event.symbol !== activeSymbolRef.current) return;
+        if (event.type === "quote") {
+          setInstruments((current) => ({
+            ...current,
+            [event.symbol!]: {
+              ...current[event.symbol!],
+              bid: Number(event.bidPrice ?? current[event.symbol!].bid),
+              ask: Number(event.askPrice ?? current[event.symbol!].ask),
+            },
+          }));
+        } else if (event.type === "trade" || event.type === "bar" || event.type === "updatedBar") {
+          const nextPrice = Number(event.price ?? event.close);
+          if (!Number.isFinite(nextPrice)) return;
+          setInstruments((current) => ({
+            ...current,
+            [event.symbol!]: { ...current[event.symbol!], price: nextPrice },
+          }));
+        }
+      };
+      socket.onclose = () => {
+        if (socketRef.current === socket) socketRef.current = null;
+        if (stopped) return;
+        setMarketDataStatus("Alpaca stream reconnecting…");
+        reconnectTimer = window.setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(15_000, reconnectDelay * 2);
+      };
+      socket.onerror = () => socket.close();
+    }
+
+    connect();
+    return () => {
+      stopped = true;
+      window.clearTimeout(reconnectTimer);
+      const socket = socketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ action: "unsubscribe", symbols: [subscribedSymbolRef.current] }));
+      }
+      socket?.close();
+      socketRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const socket = socketRef.current;
+    const previous = subscribedSymbolRef.current;
+    activeSymbolRef.current = symbol;
+    if (!socket || socket.readyState !== WebSocket.OPEN || previous === symbol) return;
+    socket.send(JSON.stringify({ action: "unsubscribe", symbols: [previous] }));
+    socket.send(JSON.stringify({ action: "subscribe", symbols: [symbol] }));
+    subscribedSymbolRef.current = symbol;
+  }, [symbol]);
 
   function selectInstrument(nextSymbol: SymbolKey) {
     const nextQuote = instruments[nextSymbol];
     setSymbol(nextSymbol);
     setLimitPrice(Number((nextQuote.price - 0.35).toFixed(2)));
     setStopPrice(Number((nextQuote.price + 0.8).toFixed(2)));
+  }
+
+  function selectCatalogueInstrument(instrument: CatalogueInstrument) {
+    setInstruments((current) => ({
+      ...current,
+      [instrument.symbol]: current[instrument.symbol] ?? {
+        name: instrument.name,
+        exchange: instrument.exchange,
+        price: 0,
+        change: 0,
+        bid: 0,
+        ask: 0,
+      },
+    }));
+    setInstrumentQuery(`${instrument.symbol} · ${instrument.name}`);
+    setSearchOpen(false);
+    setSearchResults([]);
+    setSearchLoading(false);
+    setSymbol(instrument.symbol);
+    setLimitPrice(0);
+    setStopPrice(0);
   }
 
   async function submitOrder(event: React.FormEvent) {
@@ -317,7 +492,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       if (portfolioResponse.ok) {
         const portfolio = await portfolioResponse.json() as { cash: number; positions: Array<{ symbol: string; quantity: number; average_price: number }> };
         setCash(Number(portfolio.cash));
-        setPositions(portfolio.positions.filter((item) => item.symbol in fallbackInstruments).map((item) => ({ symbol: item.symbol as SymbolKey, quantity: Number(item.quantity), averagePrice: Number(item.average_price) })));
+        setPositions(portfolio.positions.map((item) => ({ symbol: item.symbol, quantity: Number(item.quantity), averagePrice: Number(item.average_price) })));
       }
       setNotice(`${newOrder.side} ${newOrder.quantity} ${newOrder.symbol} ${newOrder.status === "FILLED" ? `filled at ${money.format(newOrder.price)}` : "accepted"}.`);
     } catch (error) {
@@ -340,13 +515,34 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           <div className="brand-mark" aria-hidden="true"><Activity /></div>
           <div><strong>SIMTRADE</strong><span>US SIMULATION</span></div>
         </div>
-        <label className="instrument-search">
+        <label className="instrument-search" onBlur={(event) => {
+          if (!event.currentTarget.contains(event.relatedTarget)) setSearchOpen(false);
+        }}>
           <Search aria-hidden="true" />
           <span className="sr-only">Search instruments</span>
-          <select value={symbol} onChange={(event) => selectInstrument(event.target.value as SymbolKey)}>
-            {(Object.keys(instruments) as SymbolKey[]).map((key) => <option key={key} value={key}>{key} · {instruments[key].name}</option>)}
-          </select>
+          <input
+            ref={searchInputRef}
+            type="search"
+            role="combobox"
+            aria-label="Search all supported US equities and ETFs"
+            aria-autocomplete="list"
+            aria-controls="instrument-results"
+            aria-expanded={searchOpen}
+            value={instrumentQuery}
+            onFocus={() => setSearchOpen(true)}
+            onChange={(event) => { setInstrumentQuery(event.target.value); setSearchResults([]); setSearchLoading(true); setSearchOpen(true); }}
+            onKeyDown={(event) => { if (event.key === "Escape") setSearchOpen(false); }}
+            placeholder="Search symbol or company"
+          />
           <span className="shortcut" aria-hidden="true">/</span>
+          {searchOpen && instrumentQuery.trim() && instrumentQuery.trim() !== `${symbol} · ${quote.name}` && <div id="instrument-results" className="instrument-results" role="listbox" aria-label="Instrument search results">
+            {searchLoading && <p role="status">Searching instruments…</p>}
+            {!searchLoading && searchResults.map((instrument) => <button key={instrument.symbol} type="button" role="option" aria-selected="false" onClick={() => selectCatalogueInstrument(instrument)}>
+              <span><strong>{instrument.symbol}</strong><small>{instrument.exchange}</small></span>
+              <span>{instrument.name}</span>
+            </button>)}
+            {!searchLoading && searchResults.length === 0 && <p>No matching instruments. Try a symbol or company name.</p>}
+          </div>}
         </label>
         <div className="topbar-actions">
           <span className="market-status"><i aria-hidden="true" /> <b>{displayedMarketDataStatus}</b></span>
@@ -369,13 +565,13 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               </button>;
             })}
           </div>
-          <button className="add-symbol"><Search aria-hidden="true" /> Add symbol</button>
+          <button className="add-symbol" onClick={() => { searchInputRef.current?.focus(); setSearchOpen(true); }}><Search aria-hidden="true" /> Add symbol</button>
           <div className="data-source"><ShieldCheck aria-hidden="true" /><span><strong>Alpaca market data</strong><small>{displayedMarketDataStatus}</small></span></div>
         </aside>
 
         <section className="main-workspace">
           <div className="quote-strip">
-            <div className="quote-identity"><span className="instrument-avatar">{symbol.slice(0, 1)}</span><div><div><h1>{symbol}</h1><span>NASDAQ</span></div><p>{quote.name} · USD</p></div></div>
+            <div className="quote-identity"><span className="instrument-avatar">{symbol.slice(0, 1)}</span><div><div><h1>{symbol}</h1><span>{quote.exchange || "US"}</span></div><p>{quote.name} · USD</p></div></div>
             <div className="quote-price"><strong>{quote.price.toFixed(2)}</strong><span className={quote.change >= 0 ? "positive" : "negative"}>{quote.change >= 0 ? "+" : ""}{(quote.price * quote.change / 100).toFixed(2)} ({quote.change >= 0 ? "+" : ""}{quote.change.toFixed(2)}%)</span></div>
             <dl className="quote-stats"><div><dt>Bid</dt><dd>{quote.bid.toFixed(2)}</dd></div><div><dt>Ask</dt><dd>{quote.ask.toFixed(2)}</dd></div><div><dt>Spread</dt><dd>{(quote.ask - quote.bid).toFixed(2)}</dd></div><div><dt>Volume</dt><dd>42.8M</dd></div></dl>
           </div>
@@ -403,9 +599,10 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               {activeTable === "positions" ? <table>
                 <thead><tr><th>Symbol</th><th>Qty</th><th>Avg price</th><th>Last</th><th>Market value</th><th>Unrealized P&amp;L</th></tr></thead>
                 <tbody>{positions.map((position) => {
-                  const last = instruments[position.symbol].price;
+                  const positionInstrument = instruments[position.symbol] ?? { name: position.symbol, exchange: "US", price: position.averagePrice, change: 0, bid: position.averagePrice, ask: position.averagePrice };
+                  const last = positionInstrument.price;
                   const pnl = (last - position.averagePrice) * position.quantity;
-                  return <tr key={position.symbol}><td><strong>{position.symbol}</strong><small>{instruments[position.symbol].name}</small></td><td>{position.quantity}</td><td>{money.format(position.averagePrice)}</td><td>{money.format(last)}</td><td>{money.format(last * position.quantity)}</td><td className={pnl >= 0 ? "positive" : "negative"}>{pnl >= 0 ? "+" : ""}{money.format(pnl)}</td></tr>;
+                  return <tr key={position.symbol}><td><strong>{position.symbol}</strong><small>{positionInstrument.name}</small></td><td>{position.quantity}</td><td>{money.format(position.averagePrice)}</td><td>{money.format(last)}</td><td>{money.format(last * position.quantity)}</td><td className={pnl >= 0 ? "positive" : "negative"}>{pnl >= 0 ? "+" : ""}{money.format(pnl)}</td></tr>;
                 })}</tbody>
               </table> : <table>
                 <thead><tr><th>Order</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead>

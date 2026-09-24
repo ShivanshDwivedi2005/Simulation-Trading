@@ -1,0 +1,34 @@
+SIMTRADE — APP FLOW
+Version: 0.1
+
+1. Account creation
+Open application -> choose Google or email -> for email enter name/email/password -> server validates and creates unverified user -> OTP is generated, hashed, stored with expiry, and emailed -> user enters OTP -> server verifies and creates $100,000 trading account -> issue access/refresh tokens -> open trading workspace.
+
+Failure paths: duplicate email, weak password, expired/incorrect OTP, resend throttling, OAuth denial. Preserve the email and provide a specific recovery action.
+
+2. Returning login
+Enter credentials or Google -> authenticate -> rotate refresh token -> load account summary, watchlist, open positions, and open orders in parallel -> connect authorized market WebSocket -> subscribe only to visible/watchlist symbols.
+
+3. Instrument discovery
+Focus search -> enter symbol/name -> debounce REST search -> select instrument -> route/state identifies canonical instrument_id -> load quote and candles -> subscribe to live symbol -> update quote, chart, order ticket, and positions from the same normalized events.
+
+4. Market BUY
+Choose BUY + MARKET + quantity -> client shows ask-side estimate -> submit with idempotency key -> authenticate -> validate -> risk checks -> compliance observes -> simulation engine reads current normalized quote -> fill at configured ask/slippage -> one transaction writes order, trade, cash, and position -> publish portfolio/order events -> UI confirms fill and refreshes totals.
+
+5. Market SELL
+Same pipeline, using bid-side pricing. Reject quantities that would create an unsupported short position unless shorting is enabled for that account.
+
+6. Limit/stop order
+Submit -> accepted after validation/risk reservation -> order engine indexes the trigger -> normalized quote event evaluates trigger -> on trigger run risk recheck and fill policy -> commit fill atomically -> publish update. Cancellation transitions an eligible order to CANCELLED and releases reserved buying power.
+
+7. Portfolio live update
+Quote event -> latest price cache -> find affected positions -> compute unrealized P&L and equity -> coalesce updates to a safe UI frequency -> send user-specific portfolio event. The ledger is not rewritten for every tick; periodic snapshots support performance charts.
+
+8. Reconnect and degraded states
+WebSocket interrupted -> UI shows reconnecting without clearing last known values -> exponential reconnect -> reauthenticate and resubscribe -> request a fresh REST snapshot before applying deltas. If the provider is unavailable, mark quotes stale and block market orders that require a fresh quote.
+
+9. Iceberg (later phase)
+Accept total/display quantities -> expose display slice internally -> fill visible remainder -> replenish up to display quantity until total is complete -> keep total progress in authoritative order state -> never pretend this order is displayed to a real exchange.
+
+10. Multi-leg strategy (later phase)
+Create strategy order with general legs and ratios -> validate every instrument and combined risk -> reserve buying power -> coordinate leg execution using configured atomicity policy -> show leg and parent states -> unwind or alert on partial strategy execution according to policy.

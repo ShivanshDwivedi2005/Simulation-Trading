@@ -3,6 +3,9 @@
 #include "cache/RedisClient.hpp"
 #include "config/Config.hpp"
 #include "database/PostgresRepository.hpp"
+#include "market/AlpacaMarketDataStream.hpp"
+#include "market/InstrumentCatalogue.hpp"
+#include "market/MarketDataHub.hpp"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -14,8 +17,12 @@ class HttpServer {
   HttpServer(boost::asio::io_context& io,
              const config::Config& config,
              database::PostgresRepository& postgres,
-             const cache::RedisClient& redis);
+             const cache::RedisClient& redis,
+             market::InstrumentCatalogue& catalogue,
+             market::AlpacaMarketDataStream& market_stream,
+             market::MarketDataHub& market_hub);
   void run();
+  void stop();
 
  private:
   void accept();
@@ -24,6 +31,9 @@ class HttpServer {
   const config::Config& config_;
   database::PostgresRepository& postgres_;
   const cache::RedisClient& redis_;
+  market::InstrumentCatalogue& catalogue_;
+  market::AlpacaMarketDataStream& market_stream_;
+  market::MarketDataHub& market_hub_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 

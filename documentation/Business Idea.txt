@@ -1,0 +1,42 @@
+SIMTRADE — BUSINESS IDEA
+Version: 0.1
+
+1. Problem
+New and intermediate traders need realistic practice without financial loss. Many paper-trading products either hide execution mechanics, depend on broker paper accounts, or provide an experience that is too simplified for risk, strategy, and compliance training.
+
+2. Solution
+SimTrade is a US-market simulation terminal that uses a shared live-market data source for both charts and executions. Users receive virtual capital, submit orders to an internal simulation engine, see portfolio P&L update, and learn how spreads, slippage, risk limits, and order behavior affect outcomes.
+
+3. Initial customer
+- Self-directed learners preparing to trade US equities.
+- Trading educators and cohorts that need consistent exercises.
+- Universities and training teams teaching market microstructure, risk, or compliance.
+- Advanced users who want to rehearse order and multi-leg workflows without broker exposure.
+
+4. Differentiation
+- The platform owns the simulation engine rather than forwarding orders to a broker paper account.
+- One normalized quote stream drives both displayed prices and fills.
+- Progressive realism: bid/ask fills first; liquidity, partial fills, market impact, and latency later.
+- Configurable risk and non-accusatory compliance alerts make the product suitable for training.
+- A provider abstraction supports future asset classes and regions without replacing the OMS.
+
+5. Business model
+- Free individual tier: delayed or basic feed, core order types, one simulated account.
+- Pro tier: richer data, advanced analytics, strategies, exports, and configurable simulations.
+- Education/team tier: cohorts, assignments, leaderboards, instructor controls, and audit exports.
+- Enterprise training tier: SSO, custom rules, private instruments, support, and reporting.
+
+6. North-star outcome
+Verified learning sessions in which a user completes a trade, reviews the execution and P&L impact, and returns to practice again.
+
+7. Guardrails
+- Clearly label all activity as simulation; never imply that an order reaches a real exchange.
+- Do not present simulated performance as a promise of real-world results.
+- Treat market-data entitlements, exchange attribution, and redistribution rules as product requirements.
+- Compliance alerts are educational surveillance signals, not findings of illegal activity.
+
+8. Initial validation plan
+- Recruit 10–20 active learners and 3–5 educators.
+- Test whether the AAPL buy-to-P&L flow can be completed unaided in under three minutes.
+- Measure order completion, chart-to-order conversion, repeat sessions, and error recovery.
+- Interview users about realism, trust, and the next simulation control they would pay for.

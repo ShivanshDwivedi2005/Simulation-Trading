@@ -1,0 +1,73 @@
+SIMTRADE — PRODUCT REQUIREMENT DOCUMENT
+Version: 0.1
+Status: Initial vertical slice
+
+1. Product objective
+Deliver a fast, credible US-equity paper-trading experience in which a registered user can discover an instrument, inspect OHLC market data, place an internally simulated order, and immediately understand the impact on cash, positions, and P&L.
+
+2. Primary persona
+An aspiring or practicing trader who understands basic order terminology and wants realistic practice with no real-money exposure.
+
+3. Initial success flow
+Register -> verify email OTP -> sign in -> receive $100,000 virtual cash -> search AAPL -> review historical and live-style prices -> submit BUY order -> receive fill based on the shared quote source -> see position, cash, and P&L update.
+
+4. V0.1 scope
+Authentication
+- Manual registration with name, email, password, and OTP verification.
+- Google OAuth.
+- Secure access/refresh token lifecycle and logout.
+- Argon2id or bcrypt password hashing; no plaintext password storage.
+
+Trading account
+- One default USD simulation account with $100,000 initial cash.
+- Cash, buying power, equity, positions, realized/unrealized/total P&L.
+- Order and trade history.
+
+Market experience
+- Start with 20–30 liquid US equities; initial interface demonstrates AAPL, NVDA, MSFT, GOOGL, and AMZN.
+- Search, watchlist, quote, bid/ask, spread, volume, OHLC candles, and timeframes.
+- Historical data over REST and live updates over WebSocket.
+- Chart and execution engine must use the same normalized market event.
+
+Order experience
+- BUY and SELL MARKET, LIMIT, STOP, and STOP_LIMIT orders.
+- States: NEW, ACCEPTED, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED.
+- Market buys use simulated ask; market sells use simulated bid.
+- Clear pre-submit estimate, rejection reason, fill confirmation, and cancellable open orders.
+
+Risk and monitoring
+- Sufficient buying power, max order quantity, max position size, concentration, max daily loss, instrument status, and duplicate validation.
+- Configurable limits.
+- Educational compliance alerts for cancellation rate, trading frequency, wash-like behavior, spoofing-like behavior, concentration, restricted symbols, rate violations, and abnormal size.
+
+5. Deferred after stable vertical slice
+- Iceberg replenishment behavior.
+- Generalized multi-leg strategies: outright, spread, butterfly, double butterfly.
+- Futures, commodities, forex, crypto, India, and UK markets.
+- Depth-aware partial fills, liquidity, slippage curves, latency, and market impact.
+- Instructor/team workflows, leaderboards, and payments.
+
+6. Functional acceptance criteria
+- A new verified user has exactly $100,000 virtual cash.
+- Selecting a watchlist symbol updates the quote, chart, and order ticket together.
+- A valid market BUY fills at the current normalized ask and atomically updates order, trade, cash, and position data.
+- An order exceeding available buying power is rejected with an actionable reason.
+- Accepted non-market orders appear in order history and can be cancelled.
+- Reconnecting a browser restores authoritative server state; browser state is not the ledger.
+- Thousands of watchers for one symbol share one upstream subscription.
+
+7. Experience acceptance criteria
+- Core trading action is visible in the first desktop viewport.
+- All controls are keyboard reachable with visible focus.
+- Functional states use text or shape in addition to color.
+- The interface works without horizontal page scrolling at 375, 768, 1024, and 1440 px.
+- Motion respects prefers-reduced-motion.
+- Charts expose a text summary and tabular fallback.
+
+8. Product metrics
+- Registration-to-first-fill conversion.
+- Median time from verified account to first filled order.
+- Order rejection rate by reason.
+- Weekly returning traders and completed learning sessions.
+- Market event-to-browser and order-to-fill latency percentiles.
+- Position/P&L reconciliation error count (target: zero).

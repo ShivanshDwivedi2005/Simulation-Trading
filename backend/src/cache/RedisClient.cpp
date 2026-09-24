@@ -42,4 +42,28 @@ RedisClient::~RedisClient() {
 bool RedisClient::healthy() const noexcept { return context_ != nullptr; }
 std::string RedisClient::status() const { return healthy() ? "ok" : (error_.empty() ? "unavailable" : error_); }
 
+bool RedisClient::set(const std::string& key, const std::string& value) const {
+  std::scoped_lock lock(mutex_);
+  if (context_ == nullptr) return false;
+  auto* reply = static_cast<redisReply*>(redisCommand(context_, "SET %b %b",
+                                                       key.data(), key.size(),
+                                                       value.data(), value.size()));
+  const bool success = reply != nullptr && reply->type != REDIS_REPLY_ERROR;
+  if (reply != nullptr) freeReplyObject(reply);
+  return success;
+}
+
+std::optional<std::string> RedisClient::get(const std::string& key) const {
+  std::scoped_lock lock(mutex_);
+  if (context_ == nullptr) return std::nullopt;
+  auto* reply = static_cast<redisReply*>(redisCommand(context_, "GET %b", key.data(), key.size()));
+  if (reply == nullptr) return std::nullopt;
+  std::optional<std::string> value;
+  if (reply->type == REDIS_REPLY_STRING && reply->str != nullptr) {
+    value = std::string(reply->str, static_cast<std::size_t>(reply->len));
+  }
+  freeReplyObject(reply);
+  return value;
+}
+
 }  // namespace simtrade::cache

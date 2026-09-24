@@ -16,8 +16,12 @@ struct Config {
   std::string log_level;
   std::string alpaca_api_key_id;
   std::string alpaca_api_secret_key;
+  std::string alpaca_trading_rest_url;
   std::string alpaca_data_rest_url;
+  std::string alpaca_data_ws_url;
   std::string alpaca_data_feed;
+  std::uint32_t alpaca_max_stream_symbols;
+  std::uint32_t alpaca_asset_sync_interval_hours;
   std::string smtp_host;
   std::uint16_t smtp_port;
   std::string smtp_username;

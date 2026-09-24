@@ -1,0 +1,55 @@
+SIMTRADE — UI/UX DESIGN SPECIFICATION
+Version: 0.1
+
+1. Experience thesis
+A precise, dense, dark trading workspace with immediate access to the market, chart, order ticket, and portfolio state. It should feel trustworthy and fast, not decorative or promotional.
+
+2. Desktop information architecture
+- Sticky top bar: identity, instrument search, market status, notifications, account.
+- Left rail: compact watchlist and data-source state.
+- Center: quote header, chart controls, OHLC chart, accessible data table, positions/orders.
+- Right rail: portfolio summary, order ticket, and current risk policy.
+
+3. Responsive behavior
+- 1440+: three-column terminal.
+- 1024–1439: narrower rails, quote metrics wrap below the price.
+- 768–1023: watchlist becomes a drawer; chart and order ticket remain side-by-side where possible.
+- Below 720: one-column flow—quote, chart, activity, account, order ticket. Tables scroll inside their own bounded wrapper; the page itself must not scroll horizontally.
+
+4. Visual tokens
+- Background #050814; surfaces #090E1D / #0E1528; borders #22304A.
+- Primary text #F8FAFC; muted text #93A4BD.
+- Positive #35D49A; negative #FF637D; information/focus #38BDF8 / #7DD3FC.
+- Use status text/badges and candle direction shapes in addition to color.
+- 4/8 px spatial rhythm; compact 7–12 px control radii; restrained shadows and glow.
+- System sans for labels; tabular monospace for prices, quantities, timestamps, and IDs.
+
+5. Interaction rules
+- All pointer actions are buttons, links, selects, or labeled inputs—not clickable generic containers.
+- Minimum primary touch target 44 px; compact desktop controls retain adequate hit areas.
+- Submit gives immediate visual feedback, then a fill/accept/reject announcement in an aria-live region.
+- Validation occurs on submit/blur with a specific cause and correction.
+- Live chart has Pause/Resume; reduced-motion removes nonessential transitions.
+- Destructive cancellation is visually distinct and only available for eligible orders.
+
+6. Chart behavior
+- Candlestick is default; line and area are alternate views.
+- Timeframes: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1D, 1W.
+- Keep at most roughly 500 candles visible; aggregate or paginate older data.
+- Show exact OHLC/volume values through interaction and provide a table fallback.
+- Live updates never steal keyboard focus. Stale/paused state is visible as text.
+
+7. Accessibility checklist
+- 4.5:1 contrast for normal text and 3:1 for meaningful non-text UI.
+- Visible focus at every control; logical DOM and tab order.
+- Icons beside text are aria-hidden; standalone icon buttons have accessible names and state.
+- Do not rely on hover, red/green, or animation alone.
+- Authentication supports paste, password managers, and clear errors.
+- Test at 200% text zoom and 375, 768, 1024, 1440 px.
+
+8. Empty/loading/error states
+- Loading: preserve chart/table geometry and show quiet skeletons only for delays above about one second.
+- Empty watchlist: explain how to add the first symbol.
+- Empty positions: show that no positions exist and point to the order ticket.
+- Quote failure: retain the last value, mark it stale with timestamp, offer Retry, and disable unsafe market submission.
+- Rejection: state the exact rule (buying power, quantity, concentration, instrument status) and the value that must change.
