@@ -48,8 +48,12 @@ namespace simtrade::database {
 PostgresRepository::PostgresRepository(const std::string& connection_string) {
   try {
     connection_ = std::make_unique<pqxx::connection>(connection_string);
-    pqxx::nontransaction tx(*connection_);
-    tx.exec("SELECT 1");
+    pqxx::work migration(*connection_);
+    migration.exec("ALTER TABLE orders ADD COLUMN IF NOT EXISTS execution_price_source VARCHAR(64), "
+                   "ADD COLUMN IF NOT EXISTS execution_price_timestamp TIMESTAMPTZ");
+    migration.exec("ALTER TABLE trades ADD COLUMN IF NOT EXISTS price_source VARCHAR(64), "
+                   "ADD COLUMN IF NOT EXISTS price_timestamp TIMESTAMPTZ");
+    migration.commit();
   } catch (const std::exception& exception) {
     error_ = exception.what();
     connection_.reset();
@@ -354,7 +358,9 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
                                                               std::optional<double> limit_price,
                                                               std::optional<double> stop_price,
                                                               double bid,
-                                                              double ask) {
+                                                              double ask,
+                                                              const std::string& price_source,
+                                                              const std::string& price_timestamp) {
   std::scoped_lock lock(mutex_);
   if (!healthy()) throw std::runtime_error("database_unavailable");
   if (!std::isfinite(quantity) || quantity <= 0.0) throw std::runtime_error("invalid_quantity");
@@ -404,8 +410,8 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
 
   const auto client_order_id = random_token().substr(0, 24);
   const auto order = transaction.exec_params(
-      "INSERT INTO orders (user_id, account_id, instrument_id, client_order_id, side, order_type, quantity, remaining_quantity, limit_price, stop_price, status, accepted_at, filled_at, average_fill_price) "
-      "VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, NULLIF($9, '')::numeric, NULLIF($10, '')::numeric, $11, now(), CASE WHEN $12 THEN now() ELSE NULL END, NULLIF($13, '')::numeric) "
+      "INSERT INTO orders (user_id, account_id, instrument_id, client_order_id, side, order_type, quantity, remaining_quantity, limit_price, stop_price, status, accepted_at, filled_at, average_fill_price, execution_price_source, execution_price_timestamp) "
+      "VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, NULLIF($9, '')::numeric, NULLIF($10, '')::numeric, $11, now(), CASE WHEN $12 THEN now() ELSE NULL END, NULLIF($13, '')::numeric, CASE WHEN $12 THEN $14 ELSE NULL END, CASE WHEN $12 THEN $15::timestamptz ELSE NULL END) "
       "RETURNING order_id::text, created_at",
       user_id,
       account_id,
@@ -419,19 +425,23 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
       stop_price ? std::to_string(*stop_price) : "",
       filled ? "FILLED" : "ACCEPTED",
       filled,
-      filled ? std::to_string(fill_price) : "");
+      filled ? std::to_string(fill_price) : "",
+      price_source,
+      price_timestamp);
 
   if (filled) {
     const auto order_id = order[0]["order_id"].as<std::string>();
     transaction.exec_params(
-        "INSERT INTO trades (order_id, user_id, account_id, instrument_id, side, quantity, price) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7)",
+        "INSERT INTO trades (order_id, user_id, account_id, instrument_id, side, quantity, price, price_source, price_timestamp) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9::timestamptz)",
         order_id,
         user_id,
         account_id,
         instrument_id,
         side,
         quantity,
-        fill_price);
+        fill_price,
+        price_source,
+        price_timestamp);
     if (side == "BUY") {
       transaction.exec_params("UPDATE trading_accounts SET cash = cash - $2, version = version + 1, updated_at = now() WHERE account_id = $1::uuid", account_id, notional);
       transaction.exec_params(
@@ -466,6 +476,8 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
       {"quantity", quantity},
       {"price", filled ? fill_price : limit_price.value_or(stop_price.value_or(0.0))},
       {"status", filled ? "FILLED" : "ACCEPTED"},
+      {"price_source", filled ? nlohmann::json(price_source) : nlohmann::json(nullptr)},
+      {"price_timestamp", filled ? nlohmann::json(price_timestamp) : nlohmann::json(nullptr)},
       {"created_at", order[0]["created_at"].as<std::string>()},
   };
 }

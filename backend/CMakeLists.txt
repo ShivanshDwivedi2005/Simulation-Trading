@@ -25,6 +25,7 @@ add_executable(simtrade-api
   src/market/AlpacaMarketDataStream.cpp
   src/market/SubscriptionManager.cpp
   src/market/MarketDataHub.cpp
+  src/market/MarketDataRestClient.cpp
   src/api/HttpServer.cpp
 )
 
@@ -53,9 +54,11 @@ if(BUILD_TESTING)
     src/market/MarketDataCore.cpp
     src/market/SubscriptionManager.cpp
     src/market/MarketDataHub.cpp
+    src/market/MarketDataRestClient.cpp
   )
   target_include_directories(simtrade-market-data-tests PRIVATE include)
   target_link_libraries(simtrade-market-data-tests PRIVATE
+    CURL::libcurl
     nlohmann_json::nlohmann_json
     Threads::Threads
   )

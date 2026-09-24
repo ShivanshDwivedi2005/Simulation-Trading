@@ -1,12 +1,17 @@
 #include "market/MarketDataHub.hpp"
+#include "market/MarketDataRestClient.hpp"
 
 #include <array>
 #include <vector>
 
 namespace simtrade::market {
 
-MarketDataHub::MarketDataHub(ViewerSubscriptionSink& upstream, CacheReader cache_reader)
-    : upstream_(upstream), cache_reader_(std::move(cache_reader)) {}
+MarketDataHub::MarketDataHub(ViewerSubscriptionSink& upstream,
+                             CacheReader cache_reader,
+                             FallbackFetcher fallback_fetcher)
+    : upstream_(upstream),
+      cache_reader_(std::move(cache_reader)),
+      fallback_fetcher_(std::move(fallback_fetcher)) {}
 
 MarketDataHub::ClientId MarketDataHub::add_client(Sender sender) {
   std::scoped_lock lock(mutex_);
@@ -39,6 +44,7 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
   try {
     input = nlohmann::json::parse(message);
   } catch (const nlohmann::json::exception&) {
+    ++malformed_message_count_;
     Sender sender;
     {
       std::scoped_lock lock(mutex_);
@@ -108,7 +114,7 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
                                               ? "Live market data is available."
                                               : result.state == WatchState::connecting
                                                     ? "Connecting to live market data."
-                                                    : "Waiting for a live market-data slot."}};
+                                                    : "Live data is currently at capacity. This stock is queued and the latest available snapshot is being shown."}};
         if (result.queue_position) status["queuePosition"] = *result.queue_position;
         if (sender) sender(status.dump());
         accepted.push_back(symbol);
@@ -135,7 +141,11 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
         continue;
       }
       accepted.push_back(symbol);
-      send_cached(sender, symbol);
+      if (result.state == WatchState::live) {
+        send_cached(sender, symbol);
+      } else {
+        send_fallback(sender, symbol);
+      }
       if (sender) {
         nlohmann::json status{{"type", "market_data_status"},
                               {"symbol", symbol},
@@ -147,7 +157,7 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
                                               ? "Live market data is available."
                                               : result.state == WatchState::connecting
                                                     ? "Connecting to live market data."
-                                                    : "Waiting for a live market-data slot."}};
+                                                    : "Live data is currently at capacity. This stock is queued and the latest available snapshot is being shown."}};
         if (result.queue_position) status["queuePosition"] = *result.queue_position;
         sender(status.dump());
       }
@@ -206,20 +216,6 @@ void MarketDataHub::publish_status(const std::string& raw_symbol,
                          {"message", message}};
   if (queue_position) payload["queuePosition"] = *queue_position;
   publish(payload);
-  if (!live) return;
-
-  std::vector<Sender> recipients;
-  {
-    std::scoped_lock lock(mutex_);
-    const auto viewers = symbol_clients_.find(symbol);
-    if (viewers != symbol_clients_.end()) {
-      for (const auto client_id : viewers->second) {
-        const auto client = clients_.find(client_id);
-        if (client != clients_.end()) recipients.push_back(client->second.sender);
-      }
-    }
-  }
-  for (const auto& recipient : recipients) send_cached(recipient, symbol);
 }
 
 std::size_t MarketDataHub::client_count() const {
@@ -234,17 +230,54 @@ std::size_t MarketDataHub::viewer_count(const std::string& raw_symbol) const {
   return viewers == symbol_clients_.end() ? 0 : viewers->second.size();
 }
 
+std::size_t MarketDataHub::stale_data_event_count() const noexcept { return stale_data_event_count_.load(); }
+
+std::size_t MarketDataHub::malformed_message_count() const noexcept { return malformed_message_count_.load(); }
+
+std::size_t MarketDataHub::cache_failure_count() const noexcept { return cache_failure_count_.load(); }
+
+void MarketDataHub::send_fallback(const Sender& sender, const std::string& symbol) const {
+  send_cached(sender, symbol);
+  if (!fallback_fetcher_ || !sender) return;
+  try {
+    for (auto payload : fallback_fetcher_(symbol)) {
+      payload["symbol"] = symbol;
+      payload["live"] = false;
+      if (!payload.contains("source")) payload["source"] = "alpaca_rest_snapshot";
+      sender(payload.dump());
+    }
+  } catch (const std::exception&) {
+    sender(nlohmann::json({{"type", "market_data_status"},
+                           {"symbol", symbol},
+                           {"status", "UNAVAILABLE"},
+                           {"live", false},
+                           {"message", "Fallback market data is temporarily unavailable."}}).dump());
+  }
+}
+
 void MarketDataHub::send_cached(const Sender& sender, const std::string& symbol) const {
-  if (!cache_reader_) return;
-  const std::array<std::string, 4> keys{
+  if (!cache_reader_ || !sender) return;
+  const std::array<std::string, 3> keys{
       "market:quote:" + symbol,
       "market:trade:" + symbol,
       "market:bar:1m:" + symbol,
-      "market:status:" + symbol,
   };
   for (const auto& key : keys) {
-    const auto cached = cache_reader_(key);
-    if (cached) sender(*cached);
+    try {
+      const auto cached = cache_reader_(key);
+      if (!cached) continue;
+      auto payload = nlohmann::json::parse(*cached);
+      const auto timestamp = payload.value("timestamp", "");
+      const bool stale = !market_data_timestamp_is_fresh(timestamp, std::chrono::seconds(30));
+      payload["live"] = false;
+      payload["source"] = "redis_cache";
+      payload["stale"] = stale;
+      payload["dataStatus"] = stale ? "STALE" : "SNAPSHOT";
+      if (stale) ++stale_data_event_count_;
+      sender(payload.dump());
+    } catch (const std::exception&) {
+      ++cache_failure_count_;
+    }
   }
 }
 

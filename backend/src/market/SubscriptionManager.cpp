@@ -411,7 +411,11 @@ void SubscriptionManager::notify_queue_positions() {
   for (std::size_t index = 0; index < ordered.size(); ++index) {
     const auto& symbol = ordered[index];
     if (transition_target_ && *transition_target_ == symbol) continue;
-    notify_status(symbol, "QUEUED", false, index + 1, "Waiting for a live market-data slot.");
+    notify_status(symbol,
+                  "QUEUED",
+                  false,
+                  index + 1,
+                  "Live data is currently at capacity. This stock is queued and the latest available snapshot is being shown.");
   }
 }
 
@@ -463,7 +467,7 @@ void SubscriptionManager::handle_subscription_confirmation_impl(const std::set<s
       const auto target_symbol = target.symbol;
       if (queue_needed(target)) {
         waiting_.erase(target_symbol);
-        notify_status(target_symbol, "LIVE", true, std::nullopt, "Live market data is available.");
+        notify_status(target_symbol, "LIVE", true, std::nullopt, "Live market data connected.");
         newly_live.erase(target_symbol);
         transition_target_.reset();
       } else {
@@ -485,7 +489,7 @@ void SubscriptionManager::handle_subscription_confirmation_impl(const std::set<s
     waiting_.erase(symbol);
     const auto state = states_.find(symbol);
     if (state != states_.end() && queue_needed(state->second)) {
-      notify_status(symbol, "LIVE", true, std::nullopt, "Live market data is available.");
+      notify_status(symbol, "LIVE", true, std::nullopt, "Live market data connected.");
     }
   }
 

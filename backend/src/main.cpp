@@ -5,6 +5,7 @@
 #include "market/AlpacaMarketDataStream.hpp"
 #include "market/InstrumentCatalogue.hpp"
 #include "market/MarketDataHub.hpp"
+#include "market/MarketDataRestClient.hpp"
 #include "market/SubscriptionManager.hpp"
 
 #include <boost/asio/io_context.hpp>
@@ -39,6 +40,7 @@ int main() {
     simtrade::cache::RedisClient redis(config.redis_url);
     simtrade::market::InstrumentCatalogue catalogue(config, redis);
     simtrade::market::AlpacaMarketDataStream market_stream(config, redis);
+    simtrade::market::MarketDataRestClient market_rest_client(config);
     catalogue.start();
     simtrade::market::SubscriptionManager subscription_manager(
         market_stream,
@@ -56,7 +58,14 @@ int main() {
     }
     simtrade::market::MarketDataHub market_hub(
         subscription_manager,
-        [&redis](const std::string& key) { return redis.get(key); });
+        [&redis](const std::string& key) { return redis.get(key); },
+        [&market_rest_client](const std::string& symbol) {
+          auto events = market_rest_client.latest_snapshots({symbol});
+          auto bars = market_rest_client.historical_bars(symbol);
+          bars["type"] = "historicalBars";
+          events.push_back(std::move(bars));
+          return events;
+        });
     subscription_manager.set_status_handler(
         [&market_hub](const std::string& symbol,
                       const std::string& status,
@@ -77,7 +86,7 @@ int main() {
 
     boost::asio::io_context io(static_cast<int>(config.worker_threads));
     simtrade::api::HttpServer server(io, config, postgres, redis, catalogue, market_stream, market_hub,
-                                     subscription_manager);
+                                     subscription_manager, market_rest_client);
     server.run();
     boost::asio::signal_set signals(io, SIGINT, SIGTERM);
     signals.async_wait([&](const boost::system::error_code&, int) {

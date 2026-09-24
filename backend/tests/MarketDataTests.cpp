@@ -1,5 +1,6 @@
 #include "market/MarketDataCore.hpp"
 #include "market/MarketDataHub.hpp"
+#include "market/MarketDataRestClient.hpp"
 #include "market/SubscriptionManager.hpp"
 
 #include <atomic>
@@ -177,6 +178,14 @@ void test_viewer_reference_counting_and_disconnect_cleanup() {
   std::vector<std::string> messages;
   const auto client = hub.add_client([&messages](const std::string& message) { messages.push_back(message); });
   hub.handle_client_message(client, R"({"action":"watch","symbol":"AAPL"})");
+  const auto cached = std::find_if(messages.begin(), messages.end(), [](const auto& message) {
+    const auto payload = nlohmann::json::parse(message);
+    return payload.value("type", "") == "quote";
+  });
+  check(cached != messages.end() && !nlohmann::json::parse(*cached).value("live", true) &&
+            nlohmann::json::parse(*cached).value("source", "") == "redis_cache" &&
+            nlohmann::json::parse(*cached).value("stale", false),
+        "cached fallback data is explicitly non-live and stale");
   hub.handle_client_message(client, R"({"action":"watch","symbol":"AAPL"})");
   check(viewer_sink.watches.size() == 1 && viewer_sink.touches == std::vector<std::string>{"AAPL"} &&
             hub.viewer_count("AAPL") == 1,
@@ -185,6 +194,8 @@ void test_viewer_reference_counting_and_disconnect_cleanup() {
   hub.remove_client(client);
   check(viewer_sink.unwatches == std::vector<std::string>{"AAPL"} && hub.viewer_count("AAPL") == 0,
         "disconnect cleanup removes every viewer exactly once");
+  check(!simtrade::market::market_data_timestamp_is_fresh("2000-01-01T00:00:00Z", 30s),
+        "stale market-data timestamps fail the execution freshness check");
 }
 
 void test_lru_grace_residency_and_protection() {
@@ -391,6 +402,11 @@ void test_authentication_normalization_and_routing() {
   hub.publish({{"type", "trade"}, {"symbol", "AAPL"}, {"price", 225.2}});
   check(first_messages.size() == before_first + 1 && second_messages.size() == before_second,
         "frontend fan-out remains symbol-specific");
+  const auto before_activation = first_messages.size();
+  hub.publish_status("AAPL", "LIVE", true, std::nullopt, "Live market data connected.");
+  check(first_messages.size() == before_activation + 1 &&
+            nlohmann::json::parse(first_messages.back()).value("status", "") == "LIVE",
+        "live activation replaces fallback state without replaying cached data");
 }
 
 }  // namespace
