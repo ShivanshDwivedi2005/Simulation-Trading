@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <deque>
 #include <iomanip>
@@ -27,89 +28,6 @@ namespace {
 
 namespace http = boost::beast::http;
 namespace websocket = boost::beast::websocket;
-
-std::size_t append_response(char* data, std::size_t size, std::size_t count, void* target) {
-  const auto bytes = size * count;
-  static_cast<std::string*>(target)->append(data, bytes);
-  return bytes;
-}
-
-nlohmann::json authenticated_get(const std::string& url,
-                                 const std::string& api_key,
-                                 const std::string& api_secret) {
-  CURL* curl = curl_easy_init();
-  if (curl == nullptr) throw std::runtime_error("market_data_client_unavailable");
-
-  std::string response_body;
-  curl_slist* headers = nullptr;
-  headers = curl_slist_append(headers, ("APCA-API-KEY-ID: " + api_key).c_str());
-  headers = curl_slist_append(headers, ("APCA-API-SECRET-KEY: " + api_secret).c_str());
-  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, append_response);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_body);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 15L);
-  curl_easy_setopt(curl, CURLOPT_USERAGENT, "simtrade-api/0.1");
-
-  const auto result = curl_easy_perform(curl);
-  long status = 0;
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-
-  if (result != CURLE_OK) throw std::runtime_error("market_data_request_failed");
-  if (status == 401 || status == 403) throw std::runtime_error("alpaca_credentials_or_feed_rejected");
-  if (status == 429) throw std::runtime_error("alpaca_rate_limit_reached");
-  if (status < 200 || status >= 300) throw std::runtime_error("alpaca_http_" + std::to_string(status));
-  return nlohmann::json::parse(response_body);
-}
-
-bool valid_symbol(const std::string& symbol) {
-  return !symbol.empty() && symbol.size() <= 12 && std::all_of(symbol.begin(), symbol.end(), [](unsigned char character) {
-    return std::isalnum(character) || character == '.' || character == '-';
-  });
-}
-
-nlohmann::json alpaca_quote(const simtrade::config::Config& config, std::string symbol) {
-  if (config.alpaca_api_key_id.empty() || config.alpaca_api_secret_key.empty()) {
-    throw std::runtime_error("alpaca_not_configured");
-  }
-  std::transform(symbol.begin(), symbol.end(), symbol.begin(), [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
-  if (!valid_symbol(symbol)) throw std::runtime_error("invalid_symbol");
-
-  auto base_url = config.alpaca_data_rest_url;
-  while (!base_url.empty() && base_url.back() == '/') base_url.pop_back();
-  const auto suffix = "?symbols=" + symbol + "&feed=" + config.alpaca_data_feed;
-  const auto quotes = authenticated_get(base_url + "/v2/stocks/quotes/latest" + suffix,
-                                        config.alpaca_api_key_id,
-                                        config.alpaca_api_secret_key);
-  const auto trades = authenticated_get(base_url + "/v2/stocks/trades/latest" + suffix,
-                                        config.alpaca_api_key_id,
-                                        config.alpaca_api_secret_key);
-  if (!quotes.contains("quotes") || !quotes["quotes"].contains(symbol) ||
-      !trades.contains("trades") || !trades["trades"].contains(symbol)) {
-    throw std::runtime_error("quote_unavailable");
-  }
-
-  const auto& quote = quotes["quotes"][symbol];
-  const auto& trade = trades["trades"][symbol];
-  const double last = trade.value("p", 0.0);
-  double bid = quote.value("bp", 0.0);
-  double ask = quote.value("ap", 0.0);
-  if (bid <= 0.0) bid = last;
-  if (ask <= 0.0) ask = last;
-
-  return {
-      {"symbol", symbol},
-      {"bid", bid},
-      {"ask", ask},
-      {"last", last},
-      {"timestamp", quote.value("t", trade.value("t", ""))},
-      {"source", "alpaca"},
-      {"feed", config.alpaca_data_feed},
-  };
-}
 
 struct UploadBuffer {
   std::string content;
@@ -381,10 +299,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
               market::InstrumentCatalogue& catalogue,
               market::AlpacaMarketDataStream& market_stream,
               market::MarketDataHub& market_hub,
-              market::SubscriptionManager& subscription_manager)
+              market::SubscriptionManager& subscription_manager,
+              market::MarketDataRestClient& market_rest_client)
       : stream_(std::move(socket)), config_(config), postgres_(postgres), redis_(redis),
         catalogue_(catalogue), market_stream_(market_stream), market_hub_(market_hub),
-        subscription_manager_(subscription_manager) {}
+        subscription_manager_(subscription_manager), market_rest_client_(market_rest_client) {}
 
   void run() { read(); }
 
@@ -506,8 +425,13 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                              {{"alpacaConnected", health.connected},
                               {"feed", health.feed},
                               {"subscribedSymbolCount", health.subscribed_symbol_count},
-                              {"allocatedSymbolCount", subscription_manager_.active_symbol_count()},
+                              {"activeSymbolCount", subscription_manager_.active_symbol_count()},
                               {"pinnedSymbolCount", config_.alpaca_pinned_symbols.size()},
+                              {"dynamicSymbolCount", subscription_manager_.active_symbol_count() > config_.alpaca_pinned_symbols.size()
+                                                         ? subscription_manager_.active_symbol_count() - config_.alpaca_pinned_symbols.size()
+                                                         : 0},
+                              {"queuedSymbolCount", subscription_manager_.queued_symbol_count()},
+                              {"activeViewerCount", subscription_manager_.active_viewer_count()},
                               {"dynamicSymbolCapacity", health.maximum_symbol_count - config_.alpaca_pinned_symbols.size()},
                               {"maximumSymbolCount", health.maximum_symbol_count},
                               {"instrumentCatalogueReady", catalogue_.ready()},
@@ -515,7 +439,51 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                               {"instrumentCatalogueError", catalogue_.last_error().empty() ? nlohmann::json(nullptr) : nlohmann::json(catalogue_.last_error())},
                               {"lastMessageAt", health.last_message_at.empty() ? nlohmann::json(nullptr) : nlohmann::json(health.last_message_at)},
                               {"lastError", health.last_error.empty() ? nlohmann::json(nullptr) : nlohmann::json(health.last_error)},
-                              {"reconnectCount", health.reconnect_count}});
+                              {"reconnectCount", health.reconnect_count},
+                              {"evictions", subscription_manager_.eviction_count()},
+                              {"subscriptionTransitions", subscription_manager_.transition_count()},
+                              {"staleDataEvents", market_hub_.stale_data_event_count()},
+                              {"restRequests", market_rest_client_.request_count()},
+                              {"restRateLimitWaits", market_rest_client_.rate_limit_wait_count()},
+                              {"malformedMessages", market_hub_.malformed_message_count()},
+                              {"redisFailures", market_hub_.cache_failure_count()}});
+      }
+
+      if (request_.method() == http::verb::get && target == "/api/v1/market-data/subscriptions") {
+        const auto token = bearer_token(request_);
+        if (token.empty()) return json_response(http::status::unauthorized, {{"error", "missing_access_token"}});
+        if (!postgres_.portfolio(token)) {
+          return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
+        }
+        nlohmann::json subscriptions = nlohmann::json::array();
+        for (const auto& state : subscription_manager_.snapshot()) {
+          subscriptions.push_back({{"symbol", state.symbol},
+                                   {"pinned", state.pinned},
+                                   {"subscribed", state.subscribed},
+                                   {"subscribePending", state.subscribe_pending},
+                                   {"unsubscribePending", state.unsubscribe_pending},
+                                   {"viewerCount", state.viewer_count},
+                                   {"pendingOrderCount", state.pending_order_count}});
+        }
+        return json_response(http::status::ok, {{"subscriptions", subscriptions}});
+      }
+
+      if (request_.method() == http::verb::get && target == "/api/v1/market-data/queue") {
+        const auto token = bearer_token(request_);
+        if (token.empty()) return json_response(http::status::unauthorized, {{"error", "missing_access_token"}});
+        if (!postgres_.portfolio(token)) {
+          return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
+        }
+        nlohmann::json queue = nlohmann::json::array();
+        for (const auto& entry : subscription_manager_.queue_snapshot()) {
+          queue.push_back({{"symbol", entry.symbol},
+                           {"position", entry.position},
+                           {"viewerDemand", entry.viewer_demand},
+                           {"pendingOrderDemand", entry.pending_order_demand},
+                           {"waitingMilliseconds", entry.waiting_for.count()},
+                           {"connecting", entry.connecting}});
+        }
+        return json_response(http::status::ok, {{"queue", queue}});
       }
 
       if (request_.method() == http::verb::post && target == "/api/v1/auth/password-reset/request") {
@@ -586,18 +554,20 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const bool requires_protection = order_type != "MARKET";
         if (requires_protection) {
           const auto protection = subscription_manager_.protect_order(symbol);
-          if (protection == market::WatchResult::invalid_symbol) {
+          if (protection.state == market::WatchState::invalid_symbol) {
             return json_response(http::status::bad_request,
                                  {{"error", "invalid_symbol"}, {"message", "Instrument is not in the active catalogue."}});
           }
-          if (protection == market::WatchResult::capacity_full) {
-            return json_response(http::status::conflict,
-                                 {{"error", "CAPACITY_FULL"},
-                                  {"message", "All live market-data slots are currently in use."}});
-          }
         }
         try {
-          const auto quote = alpaca_quote(config_, symbol);
+          const auto quote = market_rest_client_.quote(symbol);
+          if (quote.value("stale", true) ||
+              !market::market_data_timestamp_is_fresh(quote.value("timestamp", ""), std::chrono::seconds(30))) {
+            if (requires_protection) subscription_manager_.release_order(symbol);
+            return json_response(http::status::service_unavailable,
+                                 {{"error", "STALE_MARKET_DATA"},
+                                  {"message", "The latest market price is too old to execute or accept this order safely."}});
+          }
           const auto order = postgres_.place_order(token,
                                                    symbol,
                                                    side,
@@ -606,7 +576,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                                                    input.contains("limit_price") ? std::optional<double>(input["limit_price"].get<double>()) : std::nullopt,
                                                    input.contains("stop_price") ? std::optional<double>(input["stop_price"].get<double>()) : std::nullopt,
                                                    quote["bid"].get<double>(),
-                                                   quote["ask"].get<double>());
+                                                   quote["ask"].get<double>(),
+                                                   quote.value("source", "unknown"),
+                                                   quote.value("timestamp", ""));
           if (!order) {
             if (requires_protection) subscription_manager_.release_order(symbol);
             return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
@@ -633,7 +605,12 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
 
       if (request_.method() == http::verb::get && target.rfind("/api/v1/market/", 0) == 0 && target.ends_with("/quote")) {
         const auto symbol = target.substr(15, target.size() - 15 - 6);
-        return json_response(http::status::ok, alpaca_quote(config_, symbol));
+        return json_response(http::status::ok, market_rest_client_.quote(symbol));
+      }
+
+      if (request_.method() == http::verb::get && target.rfind("/api/v1/market/", 0) == 0 && target.ends_with("/bars")) {
+        const auto symbol = target.substr(15, target.size() - 15 - 5);
+        return json_response(http::status::ok, market_rest_client_.historical_bars(symbol));
       }
 
       return json_response(http::status::not_found, {{"error", "not_found"}, {"path", target}});
@@ -685,6 +662,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   market::AlpacaMarketDataStream& market_stream_;
   market::MarketDataHub& market_hub_;
   market::SubscriptionManager& subscription_manager_;
+  market::MarketDataRestClient& market_rest_client_;
 };
 
 HttpServer::HttpServer(net::io_context& io,
@@ -694,9 +672,11 @@ HttpServer::HttpServer(net::io_context& io,
                        market::InstrumentCatalogue& catalogue,
                        market::AlpacaMarketDataStream& market_stream,
                        market::MarketDataHub& market_hub,
-                       market::SubscriptionManager& subscription_manager)
+                       market::SubscriptionManager& subscription_manager,
+                       market::MarketDataRestClient& market_rest_client)
     : io_(io), config_(config), postgres_(postgres), redis_(redis), catalogue_(catalogue),
       market_stream_(market_stream), market_hub_(market_hub), subscription_manager_(subscription_manager),
+      market_rest_client_(market_rest_client),
       acceptor_(net::make_strand(io)) {
   const auto address = net::ip::make_address(config.http_host);
   const tcp::endpoint endpoint{address, config.http_port};
@@ -717,7 +697,7 @@ void HttpServer::accept() {
   acceptor_.async_accept(net::make_strand(io_), [this](beast::error_code error, tcp::socket socket) {
     if (!error) {
       std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_, catalogue_, market_stream_,
-                                    market_hub_, subscription_manager_)->run();
+                                    market_hub_, subscription_manager_, market_rest_client_)->run();
     }
     if (acceptor_.is_open()) accept();
   });

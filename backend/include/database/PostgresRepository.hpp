@@ -49,7 +49,9 @@ class PostgresRepository {
                                                           std::optional<double> limit_price,
                                                           std::optional<double> stop_price,
                                                           double bid,
-                                                          double ask);
+                                                          double ask,
+                                                          const std::string& price_source,
+                                                          const std::string& price_timestamp);
   [[nodiscard]] std::optional<nlohmann::json> cancel_order(const std::string& access_token,
                                                            const std::string& order_id);
   [[nodiscard]] std::map<std::string, std::size_t> pending_order_symbol_counts() const;

@@ -6,6 +6,7 @@
 #include "market/AlpacaMarketDataStream.hpp"
 #include "market/InstrumentCatalogue.hpp"
 #include "market/MarketDataHub.hpp"
+#include "market/MarketDataRestClient.hpp"
 #include "market/SubscriptionManager.hpp"
 
 #include <boost/asio/io_context.hpp>
@@ -22,7 +23,8 @@ class HttpServer {
              market::InstrumentCatalogue& catalogue,
              market::AlpacaMarketDataStream& market_stream,
              market::MarketDataHub& market_hub,
-             market::SubscriptionManager& subscription_manager);
+             market::SubscriptionManager& subscription_manager,
+             market::MarketDataRestClient& market_rest_client);
   void run();
   void stop();
 
@@ -37,6 +39,7 @@ class HttpServer {
   market::AlpacaMarketDataStream& market_stream_;
   market::MarketDataHub& market_hub_;
   market::SubscriptionManager& subscription_manager_;
+  market::MarketDataRestClient& market_rest_client_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 

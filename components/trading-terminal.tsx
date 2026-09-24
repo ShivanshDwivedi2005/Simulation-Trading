@@ -23,6 +23,15 @@ type Candle = { time: string; open: number; high: number; low: number; close: nu
 type Position = { symbol: SymbolKey; quantity: number; averagePrice: number };
 type Instrument = { name: string; exchange: string; price: number; change: number; bid: number; ask: number };
 type CatalogueInstrument = { symbol: string; name: string; exchange: string; tradable: boolean; fractionable: boolean };
+type MarketDataStatus = "CONNECTING" | "LIVE" | "QUEUED" | "SNAPSHOT" | "STALE" | "UNAVAILABLE" | "ERROR";
+type MarketDataState = {
+  status: MarketDataStatus;
+  message: string;
+  queuePosition: number | null;
+  lastUpdatedAt: string | null;
+  source: string | null;
+  stale: boolean;
+};
 type Order = {
   id: string;
   symbol: SymbolKey;
@@ -44,8 +53,12 @@ const fallbackInstruments: Record<SymbolKey, Instrument> = {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/market";
+const MARKET_TIME_ZONE = "America/New_York";
 
 const intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
+const marketDataStatuses = new Set<MarketDataStatus>([
+  "CONNECTING", "LIVE", "QUEUED", "SNAPSHOT", "STALE", "UNAVAILABLE", "ERROR",
+]);
 
 function buildCandles(base: number, seed: number): Candle[] {
   let previous = base - 3.8;
@@ -78,19 +91,62 @@ const candleSets: Record<SymbolKey, Candle[]> = {
 const dynamicCandleSets = new Map<string, Candle[]>();
 
 function candlesFor(symbol: string, price: number) {
-  if (candleSets[symbol]) return candleSets[symbol];
   const existing = dynamicCandleSets.get(symbol);
   if (existing) return existing;
+  if (candleSets[symbol]) return candleSets[symbol];
   const seed = Array.from(symbol).reduce((sum, character) => sum + character.charCodeAt(0), 0);
   const candles = buildCandles(price > 0 ? price : 100, seed);
   dynamicCandleSets.set(symbol, candles);
   return candles;
 }
 
+function mergeHistoricalBars(symbol: string, rawBars: unknown[]) {
+  const byTimestamp = new Map<string, Candle>();
+  for (const raw of rawBars) {
+    if (!raw || typeof raw !== "object") continue;
+    const bar = raw as { t?: string; o?: number; h?: number; l?: number; c?: number; v?: number };
+    if (!bar.t || ![bar.o, bar.h, bar.l, bar.c, bar.v].every((value) => Number.isFinite(Number(value)))) continue;
+    const timestamp = new Date(bar.t);
+    byTimestamp.set(bar.t, {
+      time: Number.isNaN(timestamp.getTime())
+        ? bar.t
+        : timestamp.toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+          timeZone: MARKET_TIME_ZONE,
+        }),
+      open: Number(bar.o),
+      high: Number(bar.h),
+      low: Number(bar.l),
+      close: Number(bar.c),
+      volume: Number(bar.v),
+    });
+  }
+  const merged = Array.from(byTimestamp.values()).slice(-200);
+  if (merged.length > 1) dynamicCandleSets.set(symbol, merged);
+}
+
+function lastUpdateLabel(timestamp: string | null) {
+  if (!timestamp) return "No update yet";
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return "Update time unavailable";
+  return `Updated ${value.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: MARKET_TIME_ZONE,
+    timeZoneName: "short",
+  })}`;
+}
+
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
 function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; chartType: string; paused: boolean; price: number }) {
+  const [cursor, setCursor] = useState<{ x: number; y: number; index: number; price: number; locked: boolean } | null>(null);
   const candles = candlesFor(symbol, price);
   const width = 960;
   const height = 350;
@@ -106,11 +162,70 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
   const areaPoints = `${pad.left},${height - pad.bottom} ${points} ${width - pad.right},${height - pad.bottom}`;
   const gridValues = Array.from({ length: 5 }, (_, index) => min + ((max - min) * index) / 4).reverse();
   const last = candles.at(-1)!;
+  const tickIndexes = Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map((position) => Math.round(position * (candles.length - 1)))));
+  const hasHistoricalData = dynamicCandleSets.has(symbol);
+
+  function cursorFromPoint(clientX: number, clientY: number, locked: boolean, target: SVGSVGElement) {
+    const bounds = target.getBoundingClientRect();
+    const svgX = ((clientX - bounds.left) / bounds.width) * width;
+    const svgY = ((clientY - bounds.top) / bounds.height) * height;
+    const cursorX = Math.min(width - pad.right, Math.max(pad.left, svgX));
+    const cursorY = Math.min(height - pad.bottom, Math.max(pad.top, svgY));
+    const index = Math.min(
+      candles.length - 1,
+      Math.max(0, Math.round(((cursorX - pad.left) / innerWidth) * (candles.length - 1))),
+    );
+    const cursorPrice = max - ((cursorY - pad.top) / innerHeight) * (max - min);
+    setCursor({ x: cursorX, y: cursorY, index, price: cursorPrice, locked });
+  }
+
+  function handleChartKeyDown(event: React.KeyboardEvent<SVGSVGElement>) {
+    if (event.key === "Escape") {
+      setCursor(null);
+      return;
+    }
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = cursor?.index ?? candles.length - 1;
+    const currentPrice = cursor?.price ?? candles[currentIndex].close;
+    const nextIndex = event.key === "ArrowLeft"
+      ? Math.max(0, currentIndex - 1)
+      : event.key === "ArrowRight"
+        ? Math.min(candles.length - 1, currentIndex + 1)
+        : currentIndex;
+    const priceStep = (max - min) / 100;
+    const nextPrice = event.key === "ArrowUp"
+      ? Math.min(max, currentPrice + priceStep)
+      : event.key === "ArrowDown"
+        ? Math.max(min, currentPrice - priceStep)
+        : currentPrice;
+    setCursor({ x: x(nextIndex), y: y(nextPrice), index: nextIndex, price: nextPrice, locked: true });
+  }
 
   return (
     <div className="chart-shell" aria-label={`${symbol} price chart. Last price ${money.format(price)}. ${paused ? "Live updates paused." : "Live updates active."}`}>
-      <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with fifty-four simulated OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}.</p>
-      <svg className="price-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${symbol} intraday ${chartType.toLowerCase()} price chart`}>
+      <div className="chart-context">
+        <span>{hasHistoricalData ? "Historical market data" : "Simulated sample data"} · Times shown in ET</span>
+        <span>Move to inspect · Click to pin · Esc to clear</span>
+      </div>
+      <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with {candles.length} OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}. Use arrow keys to inspect time and price coordinates.</p>
+      <svg
+        className="price-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        tabIndex={0}
+        aria-label={`${symbol} intraday ${chartType.toLowerCase()} price chart. Interactive crosshair available.`}
+        aria-describedby="chart-cursor-readout"
+        onPointerMove={(event) => {
+          if (!cursor?.locked) cursorFromPoint(event.clientX, event.clientY, false, event.currentTarget);
+        }}
+        onPointerDown={(event) => {
+          event.currentTarget.focus();
+          cursorFromPoint(event.clientX, event.clientY, true, event.currentTarget);
+        }}
+        onPointerLeave={() => setCursor((current) => current?.locked ? current : null)}
+        onKeyDown={handleChartKeyDown}
+      >
         <defs>
           <linearGradient id="area-fill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.3" />
@@ -123,8 +238,8 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
             <text x={width - pad.right + 10} y={y(value) + 4} className="chart-axis">{value.toFixed(2)}</text>
           </g>
         ))}
-        {[0, 13, 26, 39, 53].map((index) => (
-          <text key={index} x={x(index)} y={height - 14} textAnchor={index === 0 ? "start" : index === 53 ? "end" : "middle"} className="chart-axis">
+        {tickIndexes.map((index) => (
+          <text key={index} x={x(index)} y={height - 14} textAnchor={index === 0 ? "start" : index === candles.length - 1 ? "end" : "middle"} className="chart-axis">
             {candles[index].time}
           </text>
         ))}
@@ -143,9 +258,21 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
         <line x1={pad.left} x2={width - pad.right} y1={y(last.close)} y2={y(last.close)} className="last-price-line" />
         <rect x={width - pad.right} y={y(last.close) - 11} width="58" height="22" rx="4" className="last-price-label" />
         <text x={width - 10} y={y(last.close) + 4} textAnchor="end" className="last-price-text">{price.toFixed(2)}</text>
+        {cursor && <g className="chart-crosshair" aria-hidden="true">
+          <line x1={cursor.x} x2={cursor.x} y1={pad.top} y2={height - pad.bottom} />
+          <line x1={pad.left} x2={width - pad.right} y1={cursor.y} y2={cursor.y} />
+          <circle cx={cursor.x} cy={cursor.y} r="4" />
+          <rect x={width - pad.right} y={cursor.y - 11} width="64" height="22" rx="4" />
+          <text x={width - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
+          <rect x={Math.min(width - pad.right - 70, Math.max(pad.left, cursor.x - 35))} y={height - pad.bottom + 7} width="70" height="22" rx="4" />
+          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{candles[cursor.index].time} ET</text>
+        </g>}
       </svg>
+      <output id="chart-cursor-readout" className="sr-only" aria-live="polite">
+        {cursor ? `${candles[cursor.index].time} Eastern Time, price ${money.format(cursor.price)}${cursor.locked ? ", crosshair pinned" : ""}.` : "No chart coordinate selected."}
+      </output>
       <details className="chart-data-table">
-        <summary>View latest OHLC data</summary>
+        <summary>View latest OHLC data ({hasHistoricalData ? "ET" : "simulated ET sample"})</summary>
         <div className="table-scroll">
           <table>
             <thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
@@ -181,17 +308,27 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   const [notice, setNotice] = useState("");
   const [mobileWatchlist, setMobileWatchlist] = useState(false);
   const [instruments, setInstruments] = useState(fallbackInstruments);
-  const [marketDataStatus, setMarketDataStatus] = useState("Connecting to Alpaca…");
+  const [marketData, setMarketData] = useState<MarketDataState>({
+    status: "CONNECTING",
+    message: "Connecting to Alpaca…",
+    queuePosition: null,
+    lastUpdatedAt: null,
+    source: null,
+    stale: false,
+  });
+  const [, setChartRevision] = useState(0);
   const [instrumentQuery, setInstrumentQuery] = useState("AAPL · Apple Inc.");
   const [searchResults, setSearchResults] = useState<CatalogueInstrument[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const marketDataStatusRef = useRef<MarketDataStatus>("CONNECTING");
   const subscribedSymbolRef = useRef(symbol);
   const activeSymbolRef = useRef(symbol);
   const pausedRef = useRef(paused);
-  const displayedMarketDataStatus = paused ? "Quote updates paused" : marketDataStatus;
+  const displayedMarketDataStatus = paused ? "Quote updates paused" : marketData.message;
+  const marketDataTone = marketData.status.toLowerCase();
 
   const quote = instruments[symbol];
   const positionsValue = useMemo(
@@ -268,7 +405,16 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     async function loadQuote() {
       try {
         const response = await fetch(`${API_URL}/api/v1/market/${symbol}/quote`, { signal: controller.signal });
-        const result = await response.json() as { last?: number; bid?: number; ask?: number; feed?: string; message?: string };
+        const result = await response.json() as {
+          last?: number;
+          bid?: number;
+          ask?: number;
+          feed?: string;
+          message?: string;
+          timestamp?: string;
+          source?: string;
+          stale?: boolean;
+        };
         if (!response.ok) throw new Error(result.message ?? "quote_request_failed");
         setInstruments((current) => ({
           ...current,
@@ -279,9 +425,23 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
             ask: Number(result.ask),
           },
         }));
+        setMarketData((current) => ({
+          ...current,
+          status: current.status === "LIVE" || current.status === "QUEUED"
+            ? current.status
+            : result.stale ? "STALE" : "SNAPSHOT",
+          message: current.status === "LIVE" || current.status === "QUEUED"
+            ? current.message
+            : result.stale ? "Latest snapshot is stale." : "Latest Alpaca snapshot is shown.",
+          lastUpdatedAt: result.timestamp ?? current.lastUpdatedAt,
+          source: result.source ?? "alpaca_rest_snapshot",
+          stale: Boolean(result.stale),
+        }));
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
-        setMarketDataStatus("Alpaca quote unavailable");
+        setMarketData((current) => current.status === "LIVE" || current.status === "QUEUED"
+          ? current
+          : { ...current, status: "UNAVAILABLE", message: "Alpaca quote unavailable" });
       }
     }
     void loadQuote();
@@ -321,6 +481,10 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   }, [paused, symbol]);
 
   useEffect(() => {
+    marketDataStatusRef.current = marketData.status;
+  }, [marketData.status]);
+
+  useEffect(() => {
     let stopped = false;
     let reconnectTimer = 0;
     let reconnectDelay = 1_000;
@@ -329,13 +493,13 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       if (stopped) return;
       const socket = new WebSocket(WS_URL);
       socketRef.current = socket;
-      setMarketDataStatus("Connecting to Alpaca stream…");
+      setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Connecting to Alpaca stream…", queuePosition: null }));
       socket.onopen = () => {
         reconnectDelay = 1_000;
         const currentSymbol = activeSymbolRef.current;
         subscribedSymbolRef.current = currentSymbol;
         socket.send(JSON.stringify({ action: "watch", symbol: currentSymbol }));
-        setMarketDataStatus("Alpaca IEX stream connected");
+        setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Requesting live market data…" }));
       };
       socket.onmessage = (message) => {
         let event: {
@@ -349,6 +513,12 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           status?: string;
           live?: boolean;
           message?: string;
+          queuePosition?: number | null;
+          timestamp?: string;
+          source?: string;
+          stale?: boolean;
+          dataStatus?: "SNAPSHOT" | "STALE";
+          bars?: unknown[];
         };
         try {
           event = JSON.parse(String(message.data));
@@ -356,29 +526,72 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           return;
         }
         if (event.type === "error") {
-          setMarketDataStatus(event.message ?? "Market stream error");
+          setMarketData((current) => ({ ...current, status: "ERROR", message: event.message ?? "Market stream error" }));
           return;
         }
         if (event.type === "market_data_status" && event.symbol === activeSymbolRef.current) {
-          if (event.status === "CAPACITY_FULL") {
-            setMarketDataStatus(event.message ?? "All live market-data slots are currently in use.");
-          } else if (event.live) {
-            setMarketDataStatus("Alpaca IEX stream connected");
-          } else {
-            setMarketDataStatus(event.message ?? "Live market data subscription pending…");
+          const nextStatus = marketDataStatuses.has(event.status as MarketDataStatus)
+            ? event.status as MarketDataStatus
+            : event.live ? "LIVE" : "ERROR";
+          if (nextStatus === "LIVE" && marketDataStatusRef.current !== "LIVE") {
+            setNotice(`${event.symbol} live market data is now connected.`);
           }
+          marketDataStatusRef.current = nextStatus;
+          setMarketData((current) => ({
+              ...current,
+              status: nextStatus,
+              message: event.message ?? (nextStatus === "LIVE" ? "Live market data connected." : "Market data status changed."),
+              queuePosition: typeof event.queuePosition === "number" ? event.queuePosition : null,
+              stale: nextStatus === "STALE" ? true : nextStatus === "LIVE" ? false : current.stale,
+          }));
           return;
         }
         if (event.type === "status" && event.symbol === activeSymbolRef.current) {
-          setMarketDataStatus(event.connected ? "Alpaca IEX stream connected" : "Alpaca stream reconnecting…");
+          if (!event.connected) {
+            setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Alpaca stream reconnecting…" }));
+          }
+          return;
+        }
+        if (event.type === "historicalBars" && event.symbol === activeSymbolRef.current && Array.isArray(event.bars)) {
+          mergeHistoricalBars(event.symbol, event.bars);
+          setChartRevision((current) => current + 1);
           return;
         }
         if (pausedRef.current || event.symbol !== activeSymbolRef.current) return;
+        const fallbackStatus = event.dataStatus ?? (event.stale ? "STALE" : "SNAPSHOT");
+        setMarketData((current) => ({
+          ...current,
+          status: event.live
+            ? "LIVE"
+            : current.status === "QUEUED" || current.status === "CONNECTING" || current.status === "LIVE"
+              ? current.status
+              : fallbackStatus,
+          message: event.live
+            ? "Live market data connected."
+            : current.status === "QUEUED" || current.status === "CONNECTING" || current.status === "LIVE"
+              ? current.message
+              : event.stale ? "Cached market data is stale." : "Latest available snapshot is shown.",
+          queuePosition: event.live ? null : current.queuePosition,
+          lastUpdatedAt: event.timestamp ?? current.lastUpdatedAt,
+          source: event.source ?? (event.live ? "alpaca_websocket" : current.source),
+          stale: Boolean(event.stale),
+        }));
         if (event.type === "quote") {
           setInstruments((current) => ({
             ...current,
             [event.symbol!]: {
               ...current[event.symbol!],
+              bid: Number(event.bidPrice ?? current[event.symbol!].bid),
+              ask: Number(event.askPrice ?? current[event.symbol!].ask),
+            },
+          }));
+        } else if (event.type === "snapshot") {
+          const nextPrice = Number(event.price);
+          setInstruments((current) => ({
+            ...current,
+            [event.symbol!]: {
+              ...current[event.symbol!],
+              price: Number.isFinite(nextPrice) ? nextPrice : current[event.symbol!].price,
               bid: Number(event.bidPrice ?? current[event.symbol!].bid),
               ask: Number(event.askPrice ?? current[event.symbol!].ask),
             },
@@ -395,7 +608,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       socket.onclose = () => {
         if (socketRef.current === socket) socketRef.current = null;
         if (stopped) return;
-        setMarketDataStatus("Alpaca stream reconnecting…");
+        setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Alpaca stream reconnecting…" }));
         reconnectTimer = window.setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(15_000, reconnectDelay * 2);
       };
@@ -419,7 +632,17 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     const socket = socketRef.current;
     const previous = subscribedSymbolRef.current;
     activeSymbolRef.current = symbol;
-    if (!socket || socket.readyState !== WebSocket.OPEN || previous === symbol) return;
+    if (previous === symbol) return;
+    marketDataStatusRef.current = "CONNECTING";
+    setMarketData({
+      status: "CONNECTING",
+      message: `Requesting ${symbol} market data…`,
+      queuePosition: null,
+      lastUpdatedAt: null,
+      source: null,
+      stale: false,
+    });
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ action: "unwatch", symbol: previous }));
     socket.send(JSON.stringify({ action: "watch", symbol }));
     subscribedSymbolRef.current = symbol;
@@ -566,7 +789,10 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           </div>}
         </label>
         <div className="topbar-actions">
-          <span className="market-status"><i aria-hidden="true" /> <b>{displayedMarketDataStatus}</b></span>
+          <span className={`market-status ${marketDataTone}`} role="status" aria-atomic="true">
+            <i aria-hidden="true" />
+            <b>{marketData.status}{marketData.status === "QUEUED" && marketData.queuePosition ? ` · #${marketData.queuePosition}` : ""}</b>
+          </span>
           <button className="icon-button" aria-label="Notifications"><Bell aria-hidden="true" /><span className="notification-dot" /></button>
           <button className="account-button" onClick={onSignOut} aria-label={`Sign out ${userName}`} title="Sign out"><span>{userName.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "ST"}</span><div><strong>{userName}</strong><small>Demo account · Sign out</small></div><ChevronDown aria-hidden="true" /></button>
         </div>
@@ -579,15 +805,15 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           <div className="watchlist-items">
             {(Object.keys(instruments) as SymbolKey[]).map((key) => {
               const item = instruments[key];
-              return <button key={key} className={`watchlist-row ${key === symbol ? "active" : ""}`} onClick={() => { selectInstrument(key); setMobileWatchlist(false); }}>
-                <span><strong>{key}</strong><small>{item.name}</small></span>
+              return <button key={key} className={`watchlist-row ${key === symbol ? "active" : ""}`} aria-label={`${key}, ${item.name}, last price ${item.price.toFixed(2)}`} onClick={() => { selectInstrument(key); setMobileWatchlist(false); }}>
+                <span><strong>{key}</strong><small title={item.name}>{item.name}</small></span>
                 <span className="numeric">{item.price.toFixed(2)}</span>
                 <span className={`numeric ${item.change >= 0 ? "positive" : "negative"}`}>{item.change >= 0 ? "+" : ""}{item.change.toFixed(2)}%</span>
               </button>;
             })}
           </div>
           <button className="add-symbol" onClick={() => { searchInputRef.current?.focus(); setSearchOpen(true); }}><Search aria-hidden="true" /> Add symbol</button>
-          <div className="data-source"><ShieldCheck aria-hidden="true" /><span><strong>Alpaca market data</strong><small>{displayedMarketDataStatus}</small></span></div>
+          <div className={`data-source ${marketDataTone}`}><ShieldCheck aria-hidden="true" /><span><strong>Alpaca market data · {marketData.status}</strong><small>{displayedMarketDataStatus}</small><small>{lastUpdateLabel(marketData.lastUpdatedAt)}</small></span></div>
         </aside>
 
         <section className="main-workspace">
@@ -607,8 +833,13 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               <div className="interval-control" aria-label="Chart timeframe">{intervals.map((item) => <button key={item} className={interval === item ? "active" : ""} onClick={() => setIntervalValue(item)}>{item}</button>)}</div>
               <button className="icon-button" aria-label={paused ? "Resume live chart" : "Pause live chart"} aria-pressed={paused} onClick={() => setPaused((current) => !current)}>{paused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}</button>
             </div>
-            <div className="ohlc-strip"><span>O <b>225.84</b></span><span>H <b>228.12</b></span><span>L <b>224.92</b></span><span>C <b className="positive">227.16</b></span><span>Vol <b>642.8K</b></span>{paused && <em>Paused</em>}</div>
-            <PriceChart symbol={symbol} chartType={chartType} paused={paused} price={quote.price} />
+            <div className="ohlc-strip">
+              <span>O <b>225.84</b></span><span>H <b>228.12</b></span><span>L <b>224.92</b></span><span>C <b className="positive">227.16</b></span><span>Vol <b>642.8K</b></span>
+              <span className={`market-data-detail ${marketDataTone}`}>{marketData.status}{marketData.queuePosition ? ` · Queue #${marketData.queuePosition}` : ""} · {lastUpdateLabel(marketData.lastUpdatedAt)}</span>
+              {marketData.stale && <em className="stale-warning">Stale data · orders require a fresh price</em>}
+              {paused && <em>Paused</em>}
+            </div>
+            <PriceChart key={`${symbol}-${chartType}`} symbol={symbol} chartType={chartType} paused={paused} price={quote.price} />
           </div>
 
           <section className="activity-panel">
@@ -642,7 +873,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           </section>
 
           <form className="order-ticket" onSubmit={submitOrder}>
-            <div className="ticket-heading"><div><small>ORDER TICKET</small><h2>{symbol}</h2></div><span className="live-badge"><i aria-hidden="true" /> LIVE</span></div>
+            <div className="ticket-heading"><div><small>ORDER TICKET</small><h2>{symbol}</h2></div><span className={`live-badge ${marketDataTone}`}><i aria-hidden="true" /> {marketData.status}</span></div>
             <div className="side-toggle"><button type="button" className={side === "BUY" ? "buy active" : "buy"} onClick={() => setSide("BUY")}>Buy</button><button type="button" className={side === "SELL" ? "sell active" : "sell"} onClick={() => setSide("SELL")}>Sell</button></div>
             <label className="field-label">Order type<select value={orderType} onChange={(event) => setOrderType(event.target.value)}><option>MARKET</option><option>LIMIT</option><option>STOP</option><option>STOP_LIMIT</option></select></label>
             <label className="field-label">Quantity<div className="input-with-unit"><input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} /><span>Shares</span></div></label>
