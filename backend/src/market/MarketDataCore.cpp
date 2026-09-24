@@ -63,7 +63,6 @@ SubscriptionResult SubscriptionRegistry::request(const std::string& raw_symbol) 
 bool SubscriptionRegistry::release(const std::string& raw_symbol) {
   const auto symbol = normalize_symbol(raw_symbol);
   std::scoped_lock lock(mutex_);
-  confirmed_.erase(symbol);
   return desired_.erase(symbol) > 0;
 }
 

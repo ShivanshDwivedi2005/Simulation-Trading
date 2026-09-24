@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <set>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -37,13 +39,42 @@ bool env_boolean(const char* name, bool fallback) {
   throw std::runtime_error(std::string(name) + " must be true or false");
 }
 
+std::vector<std::string> pinned_symbols() {
+  const auto configured = env_or("ALPACA_PINNED_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,GOOGL");
+  std::vector<std::string> symbols;
+  std::set<std::string> unique;
+  std::size_t start = 0;
+  while (start <= configured.size()) {
+    const auto comma = configured.find(',', start);
+    auto symbol = configured.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+    symbol.erase(std::remove_if(symbol.begin(), symbol.end(), [](unsigned char character) {
+      return std::isspace(character);
+    }), symbol.end());
+    std::transform(symbol.begin(), symbol.end(), symbol.begin(), [](unsigned char character) {
+      return static_cast<char>(std::toupper(character));
+    });
+    if (symbol.empty()) throw std::runtime_error("ALPACA_PINNED_SYMBOLS contains an empty symbol");
+    if (!unique.insert(symbol).second) {
+      throw std::runtime_error("ALPACA_PINNED_SYMBOLS contains duplicate symbol: " + symbol);
+    }
+    symbols.push_back(std::move(symbol));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  if (symbols.size() != 5) {
+    throw std::runtime_error("ALPACA_PINNED_SYMBOLS must contain exactly 5 unique symbols; found " +
+                             std::to_string(symbols.size()));
+  }
+  return symbols;
+}
+
 }  // namespace
 
 namespace simtrade::config {
 
 Config Config::from_environment() {
   const auto hardware_threads = std::max(2u, std::thread::hardware_concurrency());
-  return Config{
+  auto config = Config{
       .app_env = env_or("APP_ENV", "development"),
       .http_host = env_or("HTTP_HOST", "0.0.0.0"),
       .http_port = env_port("HTTP_PORT", 8080),
@@ -60,6 +91,9 @@ Config Config::from_environment() {
       .alpaca_data_feed = env_or("ALPACA_DATA_FEED", "iex"),
       .alpaca_max_stream_symbols = env_positive_integer("ALPACA_MAX_STREAM_SYMBOLS", 30),
       .alpaca_asset_sync_interval_hours = env_positive_integer("ALPACA_ASSET_SYNC_INTERVAL_HOURS", 24),
+      .alpaca_pinned_symbols = pinned_symbols(),
+      .market_data_eviction_grace_seconds = env_positive_integer("MARKET_DATA_EVICTION_GRACE_SECONDS", 30),
+      .market_data_min_residency_seconds = env_positive_integer("MARKET_DATA_MIN_RESIDENCY_SECONDS", 30),
       .smtp_host = env_or("SMTP_HOST", ""),
       .smtp_port = env_port("SMTP_PORT", 587),
       .smtp_username = env_or("SMTP_USERNAME", ""),
@@ -70,6 +104,10 @@ Config Config::from_environment() {
       .otp_pepper = env_or("OTP_PEPPER", "development-only-change-me"),
       .access_token_ttl_seconds = env_positive_integer("ACCESS_TOKEN_TTL_SECONDS", 900),
   };
+  if (config.alpaca_max_stream_symbols != 30) {
+    throw std::runtime_error("ALPACA_MAX_STREAM_SYMBOLS must be 30 for the Phase 2 five-pinned/25-dynamic allocation");
+  }
+  return config;
 }
 
 }  // namespace simtrade::config

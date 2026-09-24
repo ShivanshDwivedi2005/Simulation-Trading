@@ -62,7 +62,12 @@ InstrumentCatalogue::~InstrumentCatalogue() { stop(); }
 
 void InstrumentCatalogue::start() {
   if (running_.exchange(true)) return;
-  load_cached_catalogue();
+  try {
+    if (!load_cached_catalogue()) synchronize();
+  } catch (...) {
+    running_ = false;
+    throw;
+  }
   worker_ = std::thread([this] { run(); });
 }
 
@@ -82,6 +87,16 @@ InstrumentSearchPage InstrumentCatalogue::search(const std::string& query,
 bool InstrumentCatalogue::ready() const noexcept {
   std::scoped_lock lock(mutex_);
   return !instruments_.empty();
+}
+
+bool InstrumentCatalogue::contains(const std::string& symbol) const {
+  const auto normalized = normalize_symbol(symbol);
+  std::scoped_lock lock(mutex_);
+  const auto found = std::lower_bound(instruments_.begin(), instruments_.end(), normalized,
+                                      [](const Instrument& instrument, const std::string& value) {
+                                        return instrument.symbol < value;
+                                      });
+  return found != instruments_.end() && found->symbol == normalized;
 }
 
 std::size_t InstrumentCatalogue::size() const {
@@ -134,16 +149,18 @@ void InstrumentCatalogue::synchronize() {
 
 void InstrumentCatalogue::run() {
   while (running_) {
+    std::unique_lock lock(mutex_);
+    const bool stopped = condition_.wait_for(lock,
+                                             std::chrono::hours(config_.alpaca_asset_sync_interval_hours),
+                                             [this] { return !running_; });
+    lock.unlock();
+    if (stopped) break;
     try {
       synchronize();
     } catch (const std::exception& exception) {
-      std::scoped_lock lock(mutex_);
+      std::scoped_lock error_lock(mutex_);
       last_error_ = exception.what();
     }
-    std::unique_lock lock(mutex_);
-    condition_.wait_for(lock,
-                        std::chrono::hours(config_.alpaca_asset_sync_interval_hours),
-                        [this] { return !running_; });
   }
 }
 

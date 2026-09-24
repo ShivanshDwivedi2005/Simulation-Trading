@@ -365,6 +365,13 @@ MarketDataHealth AlpacaMarketDataStream::health() const {
 
 const SubscriptionRegistry& AlpacaMarketDataStream::subscriptions() const noexcept { return subscriptions_; }
 
+void AlpacaMarketDataStream::set_subscription_handlers(ConfirmationHandler confirmation_handler,
+                                                       ConnectionHandler connection_handler) {
+  std::scoped_lock lock(mutex_);
+  confirmation_handler_ = std::move(confirmation_handler);
+  connection_handler_ = std::move(connection_handler);
+}
+
 void AlpacaMarketDataStream::run() {
   std::uint32_t backoff_seconds = 1;
   std::mt19937 random(std::random_device{}());
@@ -418,14 +425,17 @@ void AlpacaMarketDataStream::connect_and_stream() {
       running_,
       [this](const std::string& message) { handle_message(message); },
       [this](bool connected) {
+        ConnectionHandler connection_handler;
         {
           std::scoped_lock lock(mutex_);
           connected_ = connected;
+          connection_handler = connection_handler_;
           if (connected) {
             last_message_at_ = current_iso8601();
             last_error_.clear();
           }
         }
+        if (connection_handler) connection_handler(connected);
         publish_status(connected);
       });
   session->start();
@@ -441,6 +451,19 @@ void AlpacaMarketDataStream::connect_and_stream() {
 
 void AlpacaMarketDataStream::handle_message(const std::string& message) {
   const auto document = nlohmann::json::parse(message);
+  const auto values = document.is_array() ? document : nlohmann::json::array({document});
+  bool acknowledgement = false;
+  for (const auto& value : values) {
+    if (value.is_object() && value.value("T", "") == "subscription") acknowledgement = true;
+  }
+  if (acknowledgement) {
+    ConfirmationHandler confirmation_handler;
+    {
+      std::scoped_lock lock(mutex_);
+      confirmation_handler = confirmation_handler_;
+    }
+    if (confirmation_handler) confirmation_handler(subscriptions_.confirmed());
+  }
   const auto events = normalize_alpaca_events(document, config_.alpaca_data_feed);
   for (const auto& event : events) {
     cache_normalized_event(event, [this](const std::string& key, const std::string& value) {
@@ -462,12 +485,14 @@ void AlpacaMarketDataStream::publish_status(bool connected) {
     std::scoped_lock lock(mutex_);
     handler = handler_;
   }
+  const auto confirmed = subscriptions_.confirmed();
   for (const auto& symbol : subscriptions_.desired()) {
+    const bool live = connected && confirmed.contains(symbol);
     nlohmann::json payload{{"type", "status"},
                            {"symbol", symbol},
                            {"connected", connected},
                            {"source", "alpaca_" + config_.alpaca_data_feed},
-                           {"live", connected},
+                           {"live", live},
                            {"timestamp", current_iso8601()},
                            {"cachedAt", current_iso8601()}};
     static_cast<void>(redis_.set("market:status:" + symbol, payload.dump()));

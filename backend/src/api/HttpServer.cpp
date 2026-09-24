@@ -380,9 +380,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
               const cache::RedisClient& redis,
               market::InstrumentCatalogue& catalogue,
               market::AlpacaMarketDataStream& market_stream,
-              market::MarketDataHub& market_hub)
+              market::MarketDataHub& market_hub,
+              market::SubscriptionManager& subscription_manager)
       : stream_(std::move(socket)), config_(config), postgres_(postgres), redis_(redis),
-        catalogue_(catalogue), market_stream_(market_stream), market_hub_(market_hub) {}
+        catalogue_(catalogue), market_stream_(market_stream), market_hub_(market_hub),
+        subscription_manager_(subscription_manager) {}
 
   void run() { read(); }
 
@@ -413,7 +415,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
     const auto cors_origin = allowed_cors_origin(request_, config_.cors_allowed_origins);
     if (!cors_origin.empty()) response.set(http::field::access_control_allow_origin, cors_origin);
     response.set("Vary", "Origin");
-    response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
+    response.set(http::field::access_control_allow_methods, "GET, POST, DELETE, OPTIONS");
     response.set(http::field::access_control_allow_headers, "Authorization, Content-Type");
     response.set(http::field::access_control_max_age, "600");
     response.keep_alive(request_.keep_alive());
@@ -504,6 +506,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                              {{"alpacaConnected", health.connected},
                               {"feed", health.feed},
                               {"subscribedSymbolCount", health.subscribed_symbol_count},
+                              {"allocatedSymbolCount", subscription_manager_.active_symbol_count()},
+                              {"pinnedSymbolCount", config_.alpaca_pinned_symbols.size()},
+                              {"dynamicSymbolCapacity", health.maximum_symbol_count - config_.alpaca_pinned_symbols.size()},
                               {"maximumSymbolCount", health.maximum_symbol_count},
                               {"instrumentCatalogueReady", catalogue_.ready()},
                               {"instrumentCount", catalogue_.size()},
@@ -578,18 +583,52 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         std::transform(symbol.begin(), symbol.end(), symbol.begin(), [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
         std::transform(side.begin(), side.end(), side.begin(), [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
         std::transform(order_type.begin(), order_type.end(), order_type.begin(), [](unsigned char character) { return static_cast<char>(std::toupper(character)); });
-        const auto quote = alpaca_quote(config_, symbol);
-        const auto order = postgres_.place_order(token,
-                                                 symbol,
-                                                 side,
-                                                 order_type,
-                                                 input.value("quantity", 0.0),
-                                                 input.contains("limit_price") ? std::optional<double>(input["limit_price"].get<double>()) : std::nullopt,
-                                                 input.contains("stop_price") ? std::optional<double>(input["stop_price"].get<double>()) : std::nullopt,
-                                                 quote["bid"].get<double>(),
-                                                 quote["ask"].get<double>());
+        const bool requires_protection = order_type != "MARKET";
+        if (requires_protection) {
+          const auto protection = subscription_manager_.protect_order(symbol);
+          if (protection == market::WatchResult::invalid_symbol) {
+            return json_response(http::status::bad_request,
+                                 {{"error", "invalid_symbol"}, {"message", "Instrument is not in the active catalogue."}});
+          }
+          if (protection == market::WatchResult::capacity_full) {
+            return json_response(http::status::conflict,
+                                 {{"error", "CAPACITY_FULL"},
+                                  {"message", "All live market-data slots are currently in use."}});
+          }
+        }
+        try {
+          const auto quote = alpaca_quote(config_, symbol);
+          const auto order = postgres_.place_order(token,
+                                                   symbol,
+                                                   side,
+                                                   order_type,
+                                                   input.value("quantity", 0.0),
+                                                   input.contains("limit_price") ? std::optional<double>(input["limit_price"].get<double>()) : std::nullopt,
+                                                   input.contains("stop_price") ? std::optional<double>(input["stop_price"].get<double>()) : std::nullopt,
+                                                   quote["bid"].get<double>(),
+                                                   quote["ask"].get<double>());
+          if (!order) {
+            if (requires_protection) subscription_manager_.release_order(symbol);
+            return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
+          }
+          if (requires_protection && (*order).value("status", "") != "ACCEPTED") {
+            subscription_manager_.release_order(symbol);
+          }
+          return json_response(http::status::created, *order);
+        } catch (...) {
+          if (requires_protection) subscription_manager_.release_order(symbol);
+          throw;
+        }
+      }
+
+      if (request_.method() == http::verb::delete_ && target.rfind("/api/v1/orders/", 0) == 0) {
+        const auto token = bearer_token(request_);
+        if (token.empty()) return json_response(http::status::unauthorized, {{"error", "missing_access_token"}});
+        const auto order_id = target.substr(std::string("/api/v1/orders/").size());
+        const auto order = postgres_.cancel_order(token, order_id);
         if (!order) return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
-        return json_response(http::status::created, *order);
+        subscription_manager_.release_order((*order)["symbol"].get<std::string>());
+        return json_response(http::status::ok, *order);
       }
 
       if (request_.method() == http::verb::get && target.rfind("/api/v1/market/", 0) == 0 && target.ends_with("/quote")) {
@@ -612,6 +651,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       }
       if (message == "insufficient_buying_power" || message == "insufficient_position") {
         return json_response(http::status::unprocessable_entity, {{"error", message}, {"message", message}});
+      }
+      if (message == "order_not_cancellable") {
+        return json_response(http::status::conflict, {{"error", message}, {"message", "Order is already terminal or does not exist."}});
       }
       if (message == "alpaca_not_configured") return json_response(http::status::service_unavailable, {{"error", message}});
       return json_response(http::status::bad_gateway, {{"error", "upstream_or_database_error"}, {"message", message}});
@@ -642,6 +684,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   market::InstrumentCatalogue& catalogue_;
   market::AlpacaMarketDataStream& market_stream_;
   market::MarketDataHub& market_hub_;
+  market::SubscriptionManager& subscription_manager_;
 };
 
 HttpServer::HttpServer(net::io_context& io,
@@ -650,9 +693,11 @@ HttpServer::HttpServer(net::io_context& io,
                        const cache::RedisClient& redis,
                        market::InstrumentCatalogue& catalogue,
                        market::AlpacaMarketDataStream& market_stream,
-                       market::MarketDataHub& market_hub)
+                       market::MarketDataHub& market_hub,
+                       market::SubscriptionManager& subscription_manager)
     : io_(io), config_(config), postgres_(postgres), redis_(redis), catalogue_(catalogue),
-      market_stream_(market_stream), market_hub_(market_hub), acceptor_(net::make_strand(io)) {
+      market_stream_(market_stream), market_hub_(market_hub), subscription_manager_(subscription_manager),
+      acceptor_(net::make_strand(io)) {
   const auto address = net::ip::make_address(config.http_host);
   const tcp::endpoint endpoint{address, config.http_port};
   acceptor_.open(endpoint.protocol());
@@ -671,7 +716,8 @@ void HttpServer::stop() {
 void HttpServer::accept() {
   acceptor_.async_accept(net::make_strand(io_), [this](beast::error_code error, tcp::socket socket) {
     if (!error) {
-      std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_, catalogue_, market_stream_, market_hub_)->run();
+      std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_, catalogue_, market_stream_,
+                                    market_hub_, subscription_manager_)->run();
     }
     if (acceptor_.is_open()) accept();
   });

@@ -6,6 +6,7 @@
 #include "market/AlpacaMarketDataStream.hpp"
 #include "market/InstrumentCatalogue.hpp"
 #include "market/MarketDataHub.hpp"
+#include "market/SubscriptionManager.hpp"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -20,7 +21,8 @@ class HttpServer {
              const cache::RedisClient& redis,
              market::InstrumentCatalogue& catalogue,
              market::AlpacaMarketDataStream& market_stream,
-             market::MarketDataHub& market_hub);
+             market::MarketDataHub& market_hub,
+             market::SubscriptionManager& subscription_manager);
   void run();
   void stop();
 
@@ -34,6 +36,7 @@ class HttpServer {
   market::InstrumentCatalogue& catalogue_;
   market::AlpacaMarketDataStream& market_stream_;
   market::MarketDataHub& market_hub_;
+  market::SubscriptionManager& subscription_manager_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 

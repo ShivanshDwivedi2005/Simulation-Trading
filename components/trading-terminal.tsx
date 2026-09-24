@@ -245,7 +245,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           averagePrice: Number(item.average_price),
         })));
         setOrders(loadedOrders.map((item) => ({
-          id: item.id.slice(0, 8).toUpperCase(),
+          id: item.id,
           symbol: item.symbol,
           side: item.side,
           type: item.type,
@@ -279,7 +279,6 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
             ask: Number(result.ask),
           },
         }));
-        setMarketDataStatus(`Alpaca ${(result.feed ?? "iex").toUpperCase()} connected`);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
         setMarketDataStatus("Alpaca quote unavailable");
@@ -335,7 +334,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
         reconnectDelay = 1_000;
         const currentSymbol = activeSymbolRef.current;
         subscribedSymbolRef.current = currentSymbol;
-        socket.send(JSON.stringify({ action: "subscribe", symbols: [currentSymbol] }));
+        socket.send(JSON.stringify({ action: "watch", symbol: currentSymbol }));
         setMarketDataStatus("Alpaca IEX stream connected");
       };
       socket.onmessage = (message) => {
@@ -347,6 +346,8 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           price?: number;
           close?: number;
           connected?: boolean;
+          status?: string;
+          live?: boolean;
           message?: string;
         };
         try {
@@ -356,6 +357,16 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
         }
         if (event.type === "error") {
           setMarketDataStatus(event.message ?? "Market stream error");
+          return;
+        }
+        if (event.type === "market_data_status" && event.symbol === activeSymbolRef.current) {
+          if (event.status === "CAPACITY_FULL") {
+            setMarketDataStatus(event.message ?? "All live market-data slots are currently in use.");
+          } else if (event.live) {
+            setMarketDataStatus("Alpaca IEX stream connected");
+          } else {
+            setMarketDataStatus(event.message ?? "Live market data subscription pending…");
+          }
           return;
         }
         if (event.type === "status" && event.symbol === activeSymbolRef.current) {
@@ -397,7 +408,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       window.clearTimeout(reconnectTimer);
       const socket = socketRef.current;
       if (socket?.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ action: "unsubscribe", symbols: [subscribedSymbolRef.current] }));
+        socket.send(JSON.stringify({ action: "unwatch", symbol: subscribedSymbolRef.current }));
       }
       socket?.close();
       socketRef.current = null;
@@ -409,8 +420,8 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     const previous = subscribedSymbolRef.current;
     activeSymbolRef.current = symbol;
     if (!socket || socket.readyState !== WebSocket.OPEN || previous === symbol) return;
-    socket.send(JSON.stringify({ action: "unsubscribe", symbols: [previous] }));
-    socket.send(JSON.stringify({ action: "subscribe", symbols: [symbol] }));
+    socket.send(JSON.stringify({ action: "unwatch", symbol: previous }));
+    socket.send(JSON.stringify({ action: "watch", symbol }));
     subscribedSymbolRef.current = symbol;
   }, [symbol]);
 
@@ -476,7 +487,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       };
       if (!response.ok) throw new Error((result.message ?? result.error ?? "Order rejected").replaceAll("_", " "));
       const newOrder: Order = {
-        id: result.id?.slice(0, 8).toUpperCase() ?? "ORDER",
+        id: result.id ?? "ORDER",
         symbol: result.symbol ?? symbol,
         side: result.side ?? side,
         type: result.type ?? orderType,
@@ -502,9 +513,19 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     }
   }
 
-  function cancelOrder(id: string) {
-    setOrders((current) => current.map((order) => order.id === id ? { ...order, status: "CANCELLED" } : order));
-    setNotice(`${id} cancelled.`);
+  async function cancelOrder(id: string) {
+    try {
+      const response = await fetch(`${API_URL}/api/v1/orders/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      const result = await response.json() as { status?: Order["status"]; message?: string; error?: string };
+      if (!response.ok) throw new Error((result.message ?? result.error ?? "Order cancellation failed").replaceAll("_", " "));
+      setOrders((current) => current.map((order) => order.id === id ? { ...order, status: result.status ?? "CANCELLED" } : order));
+      setNotice(`${id.slice(0, 8).toUpperCase()} cancelled.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? `Cancellation failed: ${error.message}.` : "Order cancellation failed.");
+    }
   }
 
   return (
@@ -606,7 +627,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
                 })}</tbody>
               </table> : <table>
                 <thead><tr><th>Order</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead>
-                <tbody>{orders.map((order) => <tr key={order.id}><td><strong>{order.id}</strong><small>{order.time}</small></td><td>{order.symbol}</td><td className={order.side === "BUY" ? "positive" : "negative"}>{order.side}</td><td>{order.type}</td><td>{order.quantity}</td><td>{money.format(order.price)}</td><td><span className={`status-badge ${order.status.toLowerCase()}`}>{order.status}</span></td><td>{order.status === "ACCEPTED" && <button className="table-action" onClick={() => cancelOrder(order.id)}>Cancel</button>}</td></tr>)}</tbody>
+                <tbody>{orders.map((order) => <tr key={order.id}><td><strong>{order.id.slice(0, 8).toUpperCase()}</strong><small>{order.time}</small></td><td>{order.symbol}</td><td className={order.side === "BUY" ? "positive" : "negative"}>{order.side}</td><td>{order.type}</td><td>{order.quantity}</td><td>{money.format(order.price)}</td><td><span className={`status-badge ${order.status.toLowerCase()}`}>{order.status}</span></td><td>{order.status === "ACCEPTED" && <button className="table-action" onClick={() => void cancelOrder(order.id)}>Cancel</button>}</td></tr>)}</tbody>
               </table>}
             </div>
           </section>

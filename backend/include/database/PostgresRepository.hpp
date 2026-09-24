@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <optional>
@@ -49,6 +50,9 @@ class PostgresRepository {
                                                           std::optional<double> stop_price,
                                                           double bid,
                                                           double ask);
+  [[nodiscard]] std::optional<nlohmann::json> cancel_order(const std::string& access_token,
+                                                           const std::string& order_id);
+  [[nodiscard]] std::map<std::string, std::size_t> pending_order_symbol_counts() const;
 
  private:
   std::unique_ptr<pqxx::connection> connection_;

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace simtrade::config {
 
@@ -22,6 +23,9 @@ struct Config {
   std::string alpaca_data_feed;
   std::uint32_t alpaca_max_stream_symbols;
   std::uint32_t alpaca_asset_sync_interval_hours;
+  std::vector<std::string> alpaca_pinned_symbols;
+  std::uint32_t market_data_eviction_grace_seconds;
+  std::uint32_t market_data_min_residency_seconds;
   std::string smtp_host;
   std::uint16_t smtp_port;
   std::string smtp_username;

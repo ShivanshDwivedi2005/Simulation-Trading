@@ -26,6 +26,7 @@ class InstrumentCatalogue {
                                             std::size_t page,
                                             std::size_t limit) const;
   [[nodiscard]] bool ready() const noexcept;
+  [[nodiscard]] bool contains(const std::string& symbol) const;
   [[nodiscard]] std::size_t size() const;
   [[nodiscard]] std::string last_synced_at() const;
   [[nodiscard]] std::string last_error() const;

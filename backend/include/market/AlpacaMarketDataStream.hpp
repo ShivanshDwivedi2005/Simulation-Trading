@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 
@@ -16,6 +17,9 @@ namespace simtrade::market {
 
 class AlpacaMarketDataStream final : public MarketDataProvider {
  public:
+  using ConfirmationHandler = std::function<void(const std::set<std::string>&)>;
+  using ConnectionHandler = std::function<void(bool)>;
+
   AlpacaMarketDataStream(const config::Config& config, const cache::RedisClient& redis);
   ~AlpacaMarketDataStream() override;
   AlpacaMarketDataStream(const AlpacaMarketDataStream&) = delete;
@@ -27,6 +31,8 @@ class AlpacaMarketDataStream final : public MarketDataProvider {
   bool unsubscribe(const std::string& symbol) override;
   [[nodiscard]] MarketDataHealth health() const override;
   [[nodiscard]] const SubscriptionRegistry& subscriptions() const noexcept;
+  void set_subscription_handlers(ConfirmationHandler confirmation_handler,
+                                 ConnectionHandler connection_handler);
 
  private:
   void run();
@@ -42,6 +48,8 @@ class AlpacaMarketDataStream final : public MarketDataProvider {
   mutable std::mutex mutex_;
   std::condition_variable condition_;
   EventHandler handler_;
+  ConfirmationHandler confirmation_handler_;
+  ConnectionHandler connection_handler_;
   bool connected_{false};
   std::string last_message_at_;
   std::string last_error_;

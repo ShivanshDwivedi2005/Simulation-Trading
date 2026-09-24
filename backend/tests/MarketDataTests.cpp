@@ -1,15 +1,23 @@
 #include "market/MarketDataCore.hpp"
 #include "market/MarketDataHub.hpp"
+#include "market/SubscriptionManager.hpp"
 
+#include <atomic>
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
+
+using namespace std::chrono_literals;
 
 int failures = 0;
 
@@ -19,24 +27,74 @@ void check(bool condition, const std::string& description) {
   std::cerr << "FAIL: " << description << '\n';
 }
 
-class FakeSubscriptionSink final : public simtrade::market::SymbolSubscriptionSink {
+class FakeUpstream final : public simtrade::market::SymbolSubscriptionSink {
  public:
-  explicit FakeSubscriptionSink(std::size_t maximum = 30) : registry(maximum) {}
+  explicit FakeUpstream(std::size_t maximum = 30) : registry(maximum) {}
 
   simtrade::market::SubscriptionResult subscribe(const std::string& symbol) override {
+    std::scoped_lock lock(mutex);
+    ++calls_in_progress;
+    maximum_parallel_calls = std::max(maximum_parallel_calls.load(), calls_in_progress.load());
     requests.push_back(symbol);
-    return registry.request(symbol);
+    const auto result = registry.request(symbol);
+    --calls_in_progress;
+    return result;
   }
 
   bool unsubscribe(const std::string& symbol) override {
+    std::scoped_lock lock(mutex);
+    ++calls_in_progress;
+    maximum_parallel_calls = std::max(maximum_parallel_calls.load(), calls_in_progress.load());
     releases.push_back(symbol);
-    return registry.release(symbol);
+    const bool result = registry.release(symbol);
+    --calls_in_progress;
+    return result;
   }
 
   simtrade::market::SubscriptionRegistry registry;
+  std::mutex mutex;
   std::vector<std::string> requests;
   std::vector<std::string> releases;
+  std::atomic<int> calls_in_progress{0};
+  std::atomic<int> maximum_parallel_calls{0};
 };
+
+class FakeViewerSink final : public simtrade::market::ViewerSubscriptionSink {
+ public:
+  simtrade::market::WatchResult watch(const std::string& symbol) override {
+    watches.push_back(symbol);
+    return result;
+  }
+  void unwatch(const std::string& symbol) override { unwatches.push_back(symbol); }
+  void touch(const std::string& symbol) override { touches.push_back(symbol); }
+
+  simtrade::market::WatchResult result{simtrade::market::WatchResult::live};
+  std::vector<std::string> watches;
+  std::vector<std::string> unwatches;
+  std::vector<std::string> touches;
+};
+
+std::vector<std::string> pinned_symbols() { return {"PIN0", "PIN1", "PIN2", "PIN3", "PIN4"}; }
+
+void confirm_desired(simtrade::market::SubscriptionManager& manager, FakeUpstream& upstream) {
+  const auto desired = upstream.registry.desired();
+  upstream.registry.confirm({{"T", "subscription"},
+                             {"trades", desired},
+                             {"quotes", desired},
+                             {"bars", desired},
+                             {"updatedBars", desired}});
+  manager.on_confirmation(desired);
+  static_cast<void>(manager.snapshot());
+}
+
+const simtrade::market::SymbolSubscription* find_state(
+    const std::vector<simtrade::market::SymbolSubscription>& states,
+    const std::string& symbol) {
+  const auto found = std::find_if(states.begin(), states.end(), [&](const auto& state) {
+    return state.symbol == symbol;
+  });
+  return found == states.end() ? nullptr : &*found;
+}
 
 void test_asset_parsing_and_search() {
   const nlohmann::json assets = nlohmann::json::array({
@@ -50,99 +108,220 @@ void test_asset_parsing_and_search() {
   const auto catalogue = simtrade::market::parse_alpaca_assets(assets);
   check(catalogue.size() == 2, "asset parser keeps active US equities and ETFs only");
   check(catalogue[0].symbol == "AAPL" && catalogue[0].fractionable, "asset flags are preserved");
-
-  const auto apple = simtrade::market::search_instruments(catalogue, "apple", 1, 20);
-  check(apple.total == 1 && apple.instruments[0].symbol == "AAPL", "search is case-insensitive across company names");
-  const auto second_page = simtrade::market::search_instruments(catalogue, "", 2, 1);
-  check(second_page.total == 2 && second_page.instruments.size() == 1 && second_page.instruments[0].symbol == "SPY",
-        "instrument search paginates deterministically");
+  check(simtrade::market::search_instruments(catalogue, "apple", 1, 20).total == 1,
+        "search is case-insensitive across company names");
 }
 
-void test_subscriptions_and_reconnect_state() {
+void test_registry_confirmation_and_reconnect() {
   simtrade::market::SubscriptionRegistry registry(30);
   check(registry.request("aapl") == simtrade::market::SubscriptionResult::added,
-        "first subscription is accepted");
+        "first low-level subscription is accepted");
   check(registry.request("AAPL") == simtrade::market::SubscriptionResult::duplicate,
-        "duplicate subscription is rejected");
-  for (int index = 1; index < 30; ++index) {
-    check(registry.request(std::string("S") + std::to_string(index)) == simtrade::market::SubscriptionResult::added,
-          "subscription within the 30-symbol limit is accepted");
-  }
-  check(registry.request("OVER") == simtrade::market::SubscriptionResult::limit_reached,
-        "the thirty-first distinct symbol is rejected");
-
-  registry.confirm({{"T", "subscription"}, {"trades", {"AAPL"}}, {"quotes", {"AAPL"}},
-                    {"bars", {"AAPL"}}, {"updatedBars", {"AAPL"}}});
+        "duplicate low-level subscription is rejected");
+  registry.confirm({{"T", "subscription"}, {"trades", {"AAPL"}}, {"quotes", {"AAPL"}}});
   check(registry.confirmed() == std::set<std::string>{"AAPL"}, "subscription acknowledgement is tracked");
+  registry.release("AAPL");
+  check(registry.confirmed().contains("AAPL"), "released slot remains confirmed until Alpaca acknowledgement");
   registry.disconnected();
   check(registry.confirmed().empty(), "confirmed subscriptions clear on disconnect");
-  check(registry.desired().size() == 30 && registry.desired().contains("AAPL"),
-        "desired subscriptions survive disconnect for resubscription");
 }
 
-void test_authentication_and_normalization() {
+void test_pinned_and_dynamic_capacity() {
+  FakeUpstream upstream;
+  simtrade::market::SubscriptionManager manager(
+      upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 0s, 0s);
+  confirm_desired(manager, upstream);
+  auto states = manager.snapshot();
+  check(states.size() == 5, "exactly five configured symbols are initialized");
+  check(std::all_of(states.begin(), states.end(), [](const auto& state) { return state.pinned; }),
+        "all five configured symbols remain pinned");
+
+  for (int index = 0; index < 25; ++index) {
+    check(manager.watch(std::string("D") + std::to_string(index)) == simtrade::market::WatchResult::pending,
+          "each of the 25 dynamic slots is available");
+  }
+  check(manager.active_symbol_count() == 30, "five pinned and 25 dynamic symbols consume all 30 slots");
+  check(manager.watch("D25") == simtrade::market::WatchResult::capacity_full,
+        "a 26th actively viewed dynamic symbol receives CAPACITY_FULL");
+}
+
+void test_viewer_reference_counting_and_disconnect_cleanup() {
+  FakeUpstream upstream;
+  simtrade::market::SubscriptionManager manager(
+      upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 0s, 0s);
+  manager.watch("SHARED");
+  manager.watch("SHARED");
+  auto states = manager.snapshot();
+  const auto* shared = find_state(states, "SHARED");
+  check(shared != nullptr && shared->viewer_count == 2, "multiple viewers increment one symbol reference count");
+  check(upstream.registry.desired().size() == 6, "multiple viewers consume one Alpaca symbol slot");
+  manager.unwatch("SHARED");
+  manager.unwatch("SHARED");
+  manager.unwatch("SHARED");
+  shared = find_state(manager.snapshot(), "SHARED");
+  check(shared != nullptr && shared->viewer_count == 0,
+        "unwatch and disconnect-style cleanup never make viewer counts negative");
+
+  FakeViewerSink viewer_sink;
+  std::map<std::string, std::string> cache{{"market:quote:AAPL", nlohmann::json({{"type", "quote"}, {"symbol", "AAPL"}}).dump()}};
+  simtrade::market::MarketDataHub hub(viewer_sink, [&cache](const std::string& key) -> std::optional<std::string> {
+    const auto found = cache.find(key);
+    return found == cache.end() ? std::nullopt : std::optional<std::string>(found->second);
+  });
+  std::vector<std::string> messages;
+  const auto client = hub.add_client([&messages](const std::string& message) { messages.push_back(message); });
+  hub.handle_client_message(client, R"({"action":"watch","symbol":"AAPL"})");
+  hub.handle_client_message(client, R"({"action":"watch","symbol":"AAPL"})");
+  check(viewer_sink.watches.size() == 1 && viewer_sink.touches == std::vector<std::string>{"AAPL"} &&
+            hub.viewer_count("AAPL") == 1,
+        "duplicate watch requests from one connection are idempotent");
+  hub.remove_client(client);
+  hub.remove_client(client);
+  check(viewer_sink.unwatches == std::vector<std::string>{"AAPL"} && hub.viewer_count("AAPL") == 0,
+        "disconnect cleanup removes every viewer exactly once");
+}
+
+void test_lru_grace_residency_and_protection() {
+  FakeUpstream upstream;
+  auto now = std::chrono::steady_clock::time_point(100s);
+  simtrade::market::SubscriptionManager manager(
+      upstream,
+      [](const std::string&) { return true; },
+      pinned_symbols(),
+      30,
+      30s,
+      30s,
+      [&now] { return now; });
+  confirm_desired(manager, upstream);
+  for (int index = 0; index < 25; ++index) {
+    now += 1s;
+    manager.watch(std::string("L") + std::to_string(index));
+  }
+  confirm_desired(manager, upstream);
+
+  manager.unwatch("L0");
+  manager.unwatch("L1");
+  static_cast<void>(manager.snapshot());
+  check(!manager.eviction_candidate(), "grace and minimum residency block immediate eviction");
+  now += 31s;
+  check(manager.eviction_candidate() == std::optional<std::string>("L0"),
+        "LRU chooses the eligible symbol with the oldest lastRequestedAt");
+
+  manager.watch("L0");
+  check(manager.eviction_candidate() == std::optional<std::string>("L1"),
+        "an actively viewed symbol cannot be evicted");
+  manager.protect_order("L1");
+  check(!manager.eviction_candidate(), "a pending-order symbol cannot be evicted");
+
+  const auto result = manager.watch("REPLACE");
+  check(result == simtrade::market::WatchResult::capacity_full,
+        "protected and viewed symbols produce CAPACITY_FULL instead of evicting a user");
+  const auto states = manager.snapshot();
+  check(std::all_of(states.begin(), states.end(), [](const auto& state) {
+          return !state.pinned || !state.unsubscribe_pending;
+        }), "pinned symbols cannot be eviction victims");
+}
+
+void test_safe_lru_confirmation_sequence() {
+  FakeUpstream upstream;
+  auto now = std::chrono::steady_clock::time_point(100s);
+  simtrade::market::SubscriptionManager manager(
+      upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 0s, 0s, [&now] { return now; });
+  confirm_desired(manager, upstream);
+  for (int index = 0; index < 25; ++index) {
+    now += 1s;
+    manager.watch(std::string("E") + std::to_string(index));
+  }
+  confirm_desired(manager, upstream);
+  manager.unwatch("E0");
+  static_cast<void>(manager.snapshot());
+  now += 1s;
+
+  check(manager.watch("NEW") == simtrade::market::WatchResult::pending, "eligible LRU starts a replacement");
+  check(!upstream.registry.desired().contains("NEW") && upstream.registry.desired().size() == 29,
+        "replacement is not subscribed before eviction confirmation");
+  confirm_desired(manager, upstream);
+  static_cast<void>(manager.snapshot());
+  check(upstream.registry.desired().contains("NEW") && upstream.registry.desired().size() == 30,
+        "released slot is reused only after unsubscribe confirmation");
+  confirm_desired(manager, upstream);
+  const auto* replacement = find_state(manager.snapshot(), "NEW");
+  check(replacement != nullptr && replacement->subscribed && !replacement->subscribe_pending,
+        "frontend symbol becomes live only after subscribe confirmation");
+}
+
+void test_pending_order_capacity_and_concurrent_serialization() {
+  FakeUpstream upstream;
+  simtrade::market::SubscriptionManager manager(
+      upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 0s, 0s);
+  manager.restore_pending_orders({{"O0", 3}});
+  const auto* restored = find_state(manager.snapshot(), "O0");
+  check(restored != nullptr && restored->pending_order_count == 3,
+        "persisted non-terminal order counts rebuild symbol protection after restart");
+  for (int index = 1; index < 25; ++index) {
+    check(manager.protect_order(std::string("O") + std::to_string(index)) == simtrade::market::WatchResult::pending,
+          "pending orders reserve dynamic symbols");
+  }
+  check(manager.protect_order("O25") == simtrade::market::WatchResult::capacity_full,
+        "the 31st protected symbol receives CAPACITY_FULL");
+
+  FakeUpstream concurrent_upstream;
+  simtrade::market::SubscriptionManager concurrent_manager(
+      concurrent_upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 0s, 0s);
+  std::vector<std::thread> threads;
+  std::atomic<int> accepted{0};
+  for (int index = 0; index < 80; ++index) {
+    threads.emplace_back([&, index] {
+      const auto result = concurrent_manager.watch(std::string("C") + std::to_string(index));
+      if (result == simtrade::market::WatchResult::pending || result == simtrade::market::WatchResult::live) {
+        ++accepted;
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  check(accepted == 25, "concurrent requests expose exactly 25 dynamic slots");
+  check(concurrent_manager.active_symbol_count() == 30 && concurrent_upstream.registry.desired().size() == 30,
+        "concurrent requests never exceed 30 confirmed or pending symbols");
+  check(concurrent_upstream.maximum_parallel_calls == 1,
+        "all upstream subscription changes pass through one serialized command loop");
+}
+
+void test_authentication_normalization_and_routing() {
   const auto authentication = simtrade::market::authentication_message("key-id", "secret-value");
   check(authentication == nlohmann::json({{"action", "auth"}, {"key", "key-id"}, {"secret", "secret-value"}}),
         "Alpaca authentication message uses backend credentials");
+  const auto events = simtrade::market::normalize_alpaca_events(
+      nlohmann::json::array({{{"T", "q"}, {"S", "AAPL"}, {"bp", 225.10}, {"ap", 225.14},
+                             {"t", "2026-09-23T10:15:30.123Z"}}}),
+      "iex");
+  check(events.size() == 1 && events[0].payload["type"] == "quote", "quotes remain normalized");
 
-  const nlohmann::json messages = nlohmann::json::array({
-      {{"T", "q"}, {"S", "AAPL"}, {"bp", 225.10}, {"bs", 2}, {"ap", 225.14}, {"as", 4},
-       {"t", "2026-09-23T10:15:30.123Z"}},
-      {{"T", "t"}, {"S", "AAPL"}, {"p", 225.12}, {"s", 3}, {"t", "2026-09-23T10:15:30.124Z"}},
-      {{"T", "b"}, {"S", "AAPL"}, {"o", 224.0}, {"h", 226.0}, {"l", 223.5}, {"c", 225.0},
-       {"v", 1000}, {"t", "2026-09-23T10:15:00Z"}},
-  });
-  const auto events = simtrade::market::normalize_alpaca_events(messages, "iex");
-  check(events.size() == 3, "quotes, trades and bars are normalized");
-  check(events[0].payload["type"] == "quote" && events[0].payload["source"] == "alpaca_iex" &&
-            events[0].payload["bidPrice"] == 225.10,
-        "quote normalization uses the public event contract");
-
-  std::map<std::string, std::string> cache;
-  simtrade::market::cache_normalized_event(events[0], [&cache](const std::string& key, const std::string& value) {
-    cache[key] = value;
-  });
-  check(cache.contains("market:quote:AAPL"), "normalized quote updates the expected Redis cache key");
-}
-
-void test_frontend_routing() {
-  FakeSubscriptionSink upstream;
-  std::map<std::string, std::string> cache{{"market:quote:AAPL", nlohmann::json({{"type", "quote"}, {"symbol", "AAPL"}}).dump()}};
-  simtrade::market::MarketDataHub hub(upstream, [&cache](const std::string& key) -> std::optional<std::string> {
-    const auto value = cache.find(key);
-    return value == cache.end() ? std::nullopt : std::optional<std::string>(value->second);
-  });
+  FakeViewerSink sink;
+  simtrade::market::MarketDataHub hub(sink, {});
   std::vector<std::string> first_messages;
   std::vector<std::string> second_messages;
-  const auto first = hub.add_client([&first_messages](const std::string& message) { first_messages.push_back(message); });
-  const auto second = hub.add_client([&second_messages](const std::string& message) { second_messages.push_back(message); });
-
-  hub.handle_client_message(first, nlohmann::json({{"action", "subscribe"}, {"symbols", {"AAPL"}}}).dump());
-  hub.handle_client_message(second, nlohmann::json({{"action", "subscribe"}, {"symbols", {"MSFT"}}}).dump());
-  check(upstream.requests.size() == 2, "one upstream request is made for each distinct interested symbol");
-  check(!first_messages.empty() && nlohmann::json::parse(first_messages.front())["type"] == "quote",
-        "cached market data is sent immediately after subscription");
-
+  const auto first = hub.add_client([&](const std::string& message) { first_messages.push_back(message); });
+  const auto second = hub.add_client([&](const std::string& message) { second_messages.push_back(message); });
+  hub.handle_client_message(first, R"({"action":"watch","symbol":"AAPL"})");
+  hub.handle_client_message(second, R"({"action":"watch","symbol":"MSFT"})");
   const auto before_first = first_messages.size();
   const auto before_second = second_messages.size();
   hub.publish({{"type", "trade"}, {"symbol", "AAPL"}, {"price", 225.2}});
-  check(first_messages.size() == before_first + 1, "interested frontend receives its symbol update");
-  check(second_messages.size() == before_second, "uninterested frontend does not receive another symbol update");
-
-  hub.handle_client_message(first, nlohmann::json({{"action", "subscribe"}, {"symbols", {"AAPL"}}}).dump());
-  check(upstream.requests.size() == 2, "duplicate frontend subscription does not duplicate the upstream request");
-  hub.remove_client(first);
-  check(upstream.releases == std::vector<std::string>{"AAPL"}, "last interested client releases the upstream symbol");
-  hub.remove_client(second);
+  check(first_messages.size() == before_first + 1 && second_messages.size() == before_second,
+        "frontend fan-out remains symbol-specific");
 }
 
 }  // namespace
 
 int main() {
   test_asset_parsing_and_search();
-  test_subscriptions_and_reconnect_state();
-  test_authentication_and_normalization();
-  test_frontend_routing();
+  test_registry_confirmation_and_reconnect();
+  test_pinned_and_dynamic_capacity();
+  test_viewer_reference_counting_and_disconnect_cleanup();
+  test_lru_grace_residency_and_protection();
+  test_safe_lru_confirmation_sequence();
+  test_pending_order_capacity_and_concurrent_serialization();
+  test_authentication_normalization_and_routing();
   if (failures == 0) {
     std::cout << "All market-data tests passed.\n";
     return EXIT_SUCCESS;

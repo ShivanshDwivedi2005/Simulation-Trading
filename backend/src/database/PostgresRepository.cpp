@@ -470,4 +470,45 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
   };
 }
 
+std::optional<nlohmann::json> PostgresRepository::cancel_order(const std::string& access_token,
+                                                               const std::string& order_id) {
+  std::scoped_lock lock(mutex_);
+  if (!healthy()) throw std::runtime_error("database_unavailable");
+
+  pqxx::work transaction(*connection_);
+  const auto users = transaction.exec_params(
+      "SELECT user_id::text FROM refresh_tokens "
+      "WHERE token_hash = encode(digest($1, 'sha256'), 'hex') AND revoked_at IS NULL AND expires_at > now() LIMIT 1",
+      access_token);
+  if (users.empty()) return std::nullopt;
+
+  const auto rows = transaction.exec_params(
+      "UPDATE orders o SET status = 'CANCELLED', cancelled_at = now(), updated_at = now(), version = version + 1 "
+      "FROM instruments i WHERE o.instrument_id = i.instrument_id AND o.order_id = $1::uuid "
+      "AND o.user_id = $2::uuid AND o.status IN ('NEW', 'ACCEPTED', 'PARTIALLY_FILLED') "
+      "RETURNING o.order_id::text, i.symbol, o.status",
+      order_id,
+      users[0][0].as<std::string>());
+  if (rows.empty()) throw std::runtime_error("order_not_cancellable");
+  transaction.commit();
+  return nlohmann::json{{"id", rows[0]["order_id"].as<std::string>()},
+                        {"symbol", rows[0]["symbol"].as<std::string>()},
+                        {"status", rows[0]["status"].as<std::string>()}};
+}
+
+std::map<std::string, std::size_t> PostgresRepository::pending_order_symbol_counts() const {
+  std::scoped_lock lock(mutex_);
+  if (!healthy()) throw std::runtime_error("database_unavailable");
+  pqxx::read_transaction transaction(*connection_);
+  const auto rows = transaction.exec(
+      "SELECT i.symbol, count(*)::bigint AS pending_count FROM orders o "
+      "JOIN instruments i ON i.instrument_id = o.instrument_id "
+      "WHERE o.status IN ('NEW', 'ACCEPTED', 'PARTIALLY_FILLED') GROUP BY i.symbol ORDER BY i.symbol");
+  std::map<std::string, std::size_t> counts;
+  for (const auto& row : rows) {
+    counts.emplace(row["symbol"].as<std::string>(), row["pending_count"].as<std::size_t>());
+  }
+  return counts;
+}
+
 }  // namespace simtrade::database

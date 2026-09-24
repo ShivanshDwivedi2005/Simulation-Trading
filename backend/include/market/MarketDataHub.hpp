@@ -1,6 +1,6 @@
 #pragma once
 
-#include "market/MarketDataCore.hpp"
+#include "market/SubscriptionManager.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -18,12 +18,17 @@ class MarketDataHub {
   using Sender = std::function<void(const std::string&)>;
   using CacheReader = std::function<std::optional<std::string>(const std::string&)>;
 
-  MarketDataHub(SymbolSubscriptionSink& upstream, CacheReader cache_reader);
+  MarketDataHub(ViewerSubscriptionSink& upstream, CacheReader cache_reader);
   ClientId add_client(Sender sender);
   void remove_client(ClientId client_id);
   void handle_client_message(ClientId client_id, const std::string& message);
   void publish(const nlohmann::json& event);
+  void publish_status(const std::string& symbol,
+                      const std::string& status,
+                      bool live,
+                      const std::string& message);
   [[nodiscard]] std::size_t client_count() const;
+  [[nodiscard]] std::size_t viewer_count(const std::string& symbol) const;
 
  private:
   struct Client {
@@ -34,12 +39,12 @@ class MarketDataHub {
   void send_cached(const Sender& sender, const std::string& symbol) const;
   void send_error(const Sender& sender, const std::string& code, const std::string& message) const;
 
-  SymbolSubscriptionSink& upstream_;
+  ViewerSubscriptionSink& upstream_;
   CacheReader cache_reader_;
   mutable std::mutex mutex_;
   ClientId next_client_id_{1};
   std::map<ClientId, Client> clients_;
-  std::map<std::string, std::size_t> symbol_interest_;
+  std::map<std::string, std::set<ClientId>> symbol_clients_;
 };
 
 }  // namespace simtrade::market

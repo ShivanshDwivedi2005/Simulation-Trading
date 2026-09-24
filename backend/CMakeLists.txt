@@ -23,6 +23,7 @@ add_executable(simtrade-api
   src/market/MarketDataCore.cpp
   src/market/InstrumentCatalogue.cpp
   src/market/AlpacaMarketDataStream.cpp
+  src/market/SubscriptionManager.cpp
   src/market/MarketDataHub.cpp
   src/api/HttpServer.cpp
 )
@@ -50,6 +51,7 @@ if(BUILD_TESTING)
   add_executable(simtrade-market-data-tests
     tests/MarketDataTests.cpp
     src/market/MarketDataCore.cpp
+    src/market/SubscriptionManager.cpp
     src/market/MarketDataHub.cpp
   )
   target_include_directories(simtrade-market-data-tests PRIVATE include)
