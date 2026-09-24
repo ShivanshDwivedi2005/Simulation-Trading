@@ -164,11 +164,16 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
   const last = candles.at(-1)!;
   const tickIndexes = Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map((position) => Math.round(position * (candles.length - 1)))));
   const hasHistoricalData = dynamicCandleSets.has(symbol);
+  const cursorPriceLabelWidth = 64;
+  const cursorPriceLabelGap = 8;
+  const cursorPriceLabelX = width - pad.right - cursorPriceLabelWidth - cursorPriceLabelGap;
 
   function cursorFromPoint(clientX: number, clientY: number, locked: boolean, target: SVGSVGElement) {
-    const bounds = target.getBoundingClientRect();
-    const svgX = ((clientX - bounds.left) / bounds.width) * width;
-    const svgY = ((clientY - bounds.top) / bounds.height) * height;
+    const screenTransform = target.getScreenCTM();
+    if (!screenTransform) return;
+    const svgPoint = new DOMPoint(clientX, clientY).matrixTransform(screenTransform.inverse());
+    const svgX = svgPoint.x;
+    const svgY = svgPoint.y;
     const cursorX = Math.min(width - pad.right, Math.max(pad.left, svgX));
     const cursorY = Math.min(height - pad.bottom, Math.max(pad.top, svgY));
     const index = Math.min(
@@ -262,8 +267,8 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
           <line x1={cursor.x} x2={cursor.x} y1={pad.top} y2={height - pad.bottom} />
           <line x1={pad.left} x2={width - pad.right} y1={cursor.y} y2={cursor.y} />
           <circle cx={cursor.x} cy={cursor.y} r="4" />
-          <rect x={width - pad.right} y={cursor.y - 11} width="64" height="22" rx="4" />
-          <text x={width - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
+          <rect x={cursorPriceLabelX} y={cursor.y - 11} width={cursorPriceLabelWidth} height="22" rx="4" />
+          <text x={cursorPriceLabelX + cursorPriceLabelWidth - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
           <rect x={Math.min(width - pad.right - 70, Math.max(pad.left, cursor.x - 35))} y={height - pad.bottom + 7} width="70" height="22" rx="4" />
           <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{candles[cursor.index].time} ET</text>
         </g>}
