@@ -19,7 +19,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type SymbolKey = string;
-type Candle = { time: string; open: number; high: number; low: number; close: number; volume: number };
+type Candle = { timestamp?: string; time: string; sessionMinute: number; open: number; high: number; low: number; close: number; volume: number };
 type Position = { symbol: SymbolKey; quantity: number; averagePrice: number };
 type Instrument = { name: string; exchange: string; price: number; change: number; bid: number; ask: number };
 type CatalogueInstrument = { symbol: string; name: string; exchange: string; tradable: boolean; fractionable: boolean };
@@ -54,6 +54,9 @@ const fallbackInstruments: Record<SymbolKey, Instrument> = {
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/market";
 const MARKET_TIME_ZONE = "America/New_York";
+const REGULAR_SESSION_OPEN_MINUTE = 9 * 60 + 30;
+const REGULAR_SESSION_CLOSE_MINUTE = 16 * 60;
+const REGULAR_SESSION_MINUTES = REGULAR_SESSION_CLOSE_MINUTE - REGULAR_SESSION_OPEN_MINUTE;
 
 const intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
 const marketDataStatuses = new Set<MarketDataStatus>([
@@ -62,20 +65,22 @@ const marketDataStatuses = new Set<MarketDataStatus>([
 
 function buildCandles(base: number, seed: number): Candle[] {
   let previous = base - 3.8;
-  return Array.from({ length: 54 }, (_, index) => {
-    const drift = Math.sin((index + seed) * 0.67) * 1.15 + Math.cos((index + seed) * 0.23) * 0.48 + 0.08;
+  return Array.from({ length: REGULAR_SESSION_MINUTES }, (_, index) => {
+    const drift = Math.sin((index + seed) * 0.67) * 0.18 + Math.cos((index + seed) * 0.23) * 0.08 + 0.006;
     const open = previous;
     const close = Math.max(1, open + drift);
-    const high = Math.max(open, close) + 0.42 + Math.abs(Math.sin(index * 1.7)) * 0.62;
-    const low = Math.min(open, close) - 0.36 - Math.abs(Math.cos(index * 1.33)) * 0.55;
+    const high = Math.max(open, close) + 0.08 + Math.abs(Math.sin(index * 1.7)) * 0.12;
+    const low = Math.min(open, close) - 0.07 - Math.abs(Math.cos(index * 1.33)) * 0.11;
     previous = close;
+    const sessionMinute = REGULAR_SESSION_OPEN_MINUTE + index;
     return {
-      time: `${9 + Math.floor((30 + index * 5) / 60)}:${String((30 + index * 5) % 60).padStart(2, "0")}`,
+      time: `${String(Math.floor(sessionMinute / 60)).padStart(2, "0")}:${String(sessionMinute % 60).padStart(2, "0")}`,
+      sessionMinute,
       open,
       high,
       low,
       close,
-      volume: 180_000 + ((index * 83_117 + seed * 42_013) % 720_000),
+      volume: 30_000 + ((index * 13_117 + seed * 7_013) % 120_000),
     };
   });
 }
@@ -88,43 +93,94 @@ const candleSets: Record<SymbolKey, Candle[]> = {
   AMZN: buildCandles(231.44, 23),
 };
 
-const dynamicCandleSets = new Map<string, Candle[]>();
+const marketCandleSets = new Map<string, Candle[]>();
+const fallbackCandleSets = new Map<string, Candle[]>();
+
+const marketSessionFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: MARKET_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+function marketSessionDetails(timestamp: string) {
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return null;
+  const parts = Object.fromEntries(
+    marketSessionFormatter.formatToParts(value)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  const hour = Number(parts.hour);
+  const minute = Number(parts.minute);
+  if (!parts.year || !parts.month || !parts.day || ![hour, minute].every(Number.isFinite)) return null;
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    minuteOfDay: hour * 60 + minute,
+    time: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+  };
+}
+
+function candleFromMarketBar(raw: unknown): Candle | null {
+  if (!raw || typeof raw !== "object") return null;
+  const bar = raw as { timestamp?: string; t?: string; open?: number; o?: number; high?: number; h?: number; low?: number; l?: number; close?: number; c?: number; volume?: number; v?: number };
+  const timestamp = bar.timestamp ?? bar.t;
+  const open = Number(bar.open ?? bar.o);
+  const high = Number(bar.high ?? bar.h);
+  const low = Number(bar.low ?? bar.l);
+  const close = Number(bar.close ?? bar.c);
+  const volume = Number(bar.volume ?? bar.v);
+  if (!timestamp || ![open, high, low, close, volume].every(Number.isFinite)) return null;
+  const session = marketSessionDetails(timestamp);
+  if (!session || session.minuteOfDay < REGULAR_SESSION_OPEN_MINUTE || session.minuteOfDay >= REGULAR_SESSION_CLOSE_MINUTE) return null;
+  return { timestamp, time: session.time, sessionMinute: session.minuteOfDay, open, high, low, close, volume };
+}
+
+function mergeMarketCandles(symbol: string, incoming: Candle[], incomingWins: boolean) {
+  const existing = marketCandleSets.get(symbol) ?? [];
+  const candidates = incomingWins ? [...existing, ...incoming] : [...incoming, ...existing];
+  let latestSession = "";
+  const byTimestamp = new Map<string, Candle>();
+  for (const candle of candidates) {
+    if (!candle.timestamp) continue;
+    const session = marketSessionDetails(candle.timestamp);
+    if (!session) continue;
+    if (session.date > latestSession) {
+      latestSession = session.date;
+      byTimestamp.clear();
+    }
+    if (session.date === latestSession) byTimestamp.set(candle.timestamp, candle);
+  }
+  const merged = Array.from(byTimestamp.values())
+    .sort((left, right) => left.timestamp!.localeCompare(right.timestamp!))
+    .slice(-REGULAR_SESSION_MINUTES);
+  if (merged.length === 0) return false;
+  marketCandleSets.set(symbol, merged);
+  return true;
+}
 
 function candlesFor(symbol: string, price: number) {
-  const existing = dynamicCandleSets.get(symbol);
+  const existing = marketCandleSets.get(symbol);
   if (existing) return existing;
   if (candleSets[symbol]) return candleSets[symbol];
+  const fallback = fallbackCandleSets.get(symbol);
+  if (fallback) return fallback;
   const seed = Array.from(symbol).reduce((sum, character) => sum + character.charCodeAt(0), 0);
   const candles = buildCandles(price > 0 ? price : 100, seed);
-  dynamicCandleSets.set(symbol, candles);
+  fallbackCandleSets.set(symbol, candles);
   return candles;
 }
 
 function mergeHistoricalBars(symbol: string, rawBars: unknown[]) {
-  const byTimestamp = new Map<string, Candle>();
-  for (const raw of rawBars) {
-    if (!raw || typeof raw !== "object") continue;
-    const bar = raw as { t?: string; o?: number; h?: number; l?: number; c?: number; v?: number };
-    if (!bar.t || ![bar.o, bar.h, bar.l, bar.c, bar.v].every((value) => Number.isFinite(Number(value)))) continue;
-    const timestamp = new Date(bar.t);
-    byTimestamp.set(bar.t, {
-      time: Number.isNaN(timestamp.getTime())
-        ? bar.t
-        : timestamp.toLocaleTimeString("en-US", {
-          hour: "2-digit",
-          minute: "2-digit",
-          hour12: false,
-          timeZone: MARKET_TIME_ZONE,
-        }),
-      open: Number(bar.o),
-      high: Number(bar.h),
-      low: Number(bar.l),
-      close: Number(bar.c),
-      volume: Number(bar.v),
-    });
-  }
-  const merged = Array.from(byTimestamp.values()).slice(-200);
-  if (merged.length > 1) dynamicCandleSets.set(symbol, merged);
+  return mergeMarketCandles(symbol, rawBars.map(candleFromMarketBar).filter((bar): bar is Candle => bar !== null), false);
+}
+
+function mergeLiveBar(symbol: string, rawBar: unknown) {
+  const candle = candleFromMarketBar(rawBar);
+  return candle ? mergeMarketCandles(symbol, [candle], true) : false;
 }
 
 function lastUpdateLabel(timestamp: string | null) {
@@ -146,24 +202,26 @@ const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
 function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; chartType: string; paused: boolean; price: number }) {
-  const [cursor, setCursor] = useState<{ x: number; y: number; index: number; price: number; locked: boolean } | null>(null);
+  const [cursor, setCursor] = useState<{ x: number; y: number; minute: number; time: string; price: number; locked: boolean } | null>(null);
   const candles = candlesFor(symbol, price);
   const width = 960;
   const height = 350;
   const pad = { top: 18, right: 64, bottom: 42, left: 16 };
-  const values = candles.flatMap((item) => [item.high, item.low]);
+  const values = [price, ...candles.flatMap((item) => [item.high, item.low])];
   const min = Math.min(...values) - 0.8;
   const max = Math.max(...values) + 0.8;
   const innerWidth = width - pad.left - pad.right;
   const innerHeight = height - pad.top - pad.bottom;
-  const x = (index: number) => pad.left + (index / (candles.length - 1)) * innerWidth;
+  const formatSessionMinute = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
+  const xForMinute = (minute: number) => pad.left + ((minute - REGULAR_SESSION_OPEN_MINUTE) / REGULAR_SESSION_MINUTES) * innerWidth;
+  const x = (index: number) => xForMinute(candles[index].sessionMinute);
   const y = (value: number) => pad.top + ((max - value) / (max - min)) * innerHeight;
   const points = candles.map((item, index) => `${x(index)},${y(item.close)}`).join(" ");
-  const areaPoints = `${pad.left},${height - pad.bottom} ${points} ${width - pad.right},${height - pad.bottom}`;
+  const areaPoints = `${x(0)},${height - pad.bottom} ${points} ${x(candles.length - 1)},${height - pad.bottom}`;
   const gridValues = Array.from({ length: 5 }, (_, index) => min + ((max - min) * index) / 4).reverse();
   const last = candles.at(-1)!;
-  const tickIndexes = Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map((position) => Math.round(position * (candles.length - 1)))));
-  const hasHistoricalData = dynamicCandleSets.has(symbol);
+  const sessionTicks = [0, 0.25, 0.5, 0.75, 1].map((position) => REGULAR_SESSION_OPEN_MINUTE + Math.round(position * REGULAR_SESSION_MINUTES));
+  const hasMarketData = marketCandleSets.has(symbol);
   const cursorPriceLabelWidth = 64;
   const cursorPriceLabelGap = 8;
   const cursorPriceLabelX = width - pad.right - cursorPriceLabelWidth - cursorPriceLabelGap;
@@ -176,12 +234,12 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
     const svgY = svgPoint.y;
     const cursorX = Math.min(width - pad.right, Math.max(pad.left, svgX));
     const cursorY = Math.min(height - pad.bottom, Math.max(pad.top, svgY));
-    const index = Math.min(
-      candles.length - 1,
-      Math.max(0, Math.round(((cursorX - pad.left) / innerWidth) * (candles.length - 1))),
-    );
+    const minute = Math.min(REGULAR_SESSION_CLOSE_MINUTE, Math.max(
+      REGULAR_SESSION_OPEN_MINUTE,
+      Math.round(REGULAR_SESSION_OPEN_MINUTE + ((cursorX - pad.left) / innerWidth) * REGULAR_SESSION_MINUTES),
+    ));
     const cursorPrice = max - ((cursorY - pad.top) / innerHeight) * (max - min);
-    setCursor({ x: cursorX, y: cursorY, index, price: cursorPrice, locked });
+    setCursor({ x: cursorX, y: cursorY, minute, time: formatSessionMinute(minute), price: cursorPrice, locked });
   }
 
   function handleChartKeyDown(event: React.KeyboardEvent<SVGSVGElement>) {
@@ -191,26 +249,26 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
     }
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", " "].includes(event.key)) return;
     event.preventDefault();
-    const currentIndex = cursor?.index ?? candles.length - 1;
-    const currentPrice = cursor?.price ?? candles[currentIndex].close;
-    const nextIndex = event.key === "ArrowLeft"
-      ? Math.max(0, currentIndex - 1)
+    const currentMinute = cursor?.minute ?? candles.at(-1)!.sessionMinute;
+    const nextMinute = event.key === "ArrowLeft"
+      ? Math.max(REGULAR_SESSION_OPEN_MINUTE, currentMinute - 1)
       : event.key === "ArrowRight"
-        ? Math.min(candles.length - 1, currentIndex + 1)
-        : currentIndex;
+        ? Math.min(REGULAR_SESSION_CLOSE_MINUTE, currentMinute + 1)
+        : currentMinute;
+    const currentPrice = cursor?.price ?? last.close;
     const priceStep = (max - min) / 100;
     const nextPrice = event.key === "ArrowUp"
       ? Math.min(max, currentPrice + priceStep)
       : event.key === "ArrowDown"
         ? Math.max(min, currentPrice - priceStep)
         : currentPrice;
-    setCursor({ x: x(nextIndex), y: y(nextPrice), index: nextIndex, price: nextPrice, locked: true });
+    setCursor({ x: xForMinute(nextMinute), y: y(nextPrice), minute: nextMinute, time: formatSessionMinute(nextMinute), price: nextPrice, locked: true });
   }
 
   return (
     <div className="chart-shell" aria-label={`${symbol} price chart. Last price ${money.format(price)}. ${paused ? "Live updates paused." : "Live updates active."}`}>
       <div className="chart-context">
-        <span>{hasHistoricalData ? "Historical market data" : "Simulated sample data"} · Times shown in ET</span>
+        <span>{hasMarketData ? "Market data" : "Simulated sample data"} · Regular session · Times shown in ET</span>
         <span>Move to inspect · Click to pin · Esc to clear</span>
       </div>
       <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with {candles.length} OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}. Use arrow keys to inspect time and price coordinates.</p>
@@ -243,14 +301,14 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
             <text x={width - pad.right + 10} y={y(value) + 4} className="chart-axis">{value.toFixed(2)}</text>
           </g>
         ))}
-        {tickIndexes.map((index) => (
-          <text key={index} x={x(index)} y={height - 14} textAnchor={index === 0 ? "start" : index === candles.length - 1 ? "end" : "middle"} className="chart-axis">
-            {candles[index].time}
+        {sessionTicks.map((minute, index) => (
+          <text key={minute} x={xForMinute(minute)} y={height - 14} textAnchor={index === 0 ? "start" : index === sessionTicks.length - 1 ? "end" : "middle"} className="chart-axis">
+            {formatSessionMinute(minute)}
           </text>
         ))}
         {chartType === "Candles" && candles.map((item, index) => {
           const rising = item.close >= item.open;
-          const candleWidth = Math.max(4, innerWidth / candles.length - 5);
+          const candleWidth = Math.max(1, Math.min(12, (innerWidth / REGULAR_SESSION_MINUTES) * 0.72));
           return (
             <g key={`${item.time}-${index}`} className={rising ? "candle-positive" : "candle-negative"}>
               <line x1={x(index)} x2={x(index)} y1={y(item.high)} y2={y(item.low)} />
@@ -260,9 +318,9 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
         })}
         {chartType === "Area" && <polygon points={areaPoints} fill="url(#area-fill)" />}
         {chartType !== "Candles" && <polyline points={points} className="price-line" />}
-        <line x1={pad.left} x2={width - pad.right} y1={y(last.close)} y2={y(last.close)} className="last-price-line" />
-        <rect x={width - pad.right} y={y(last.close) - 11} width="58" height="22" rx="4" className="last-price-label" />
-        <text x={width - 10} y={y(last.close) + 4} textAnchor="end" className="last-price-text">{price.toFixed(2)}</text>
+        <line x1={pad.left} x2={width - pad.right} y1={y(price)} y2={y(price)} className="last-price-line" />
+        <rect x={width - pad.right} y={y(price) - 11} width="58" height="22" rx="4" className="last-price-label" />
+        <text x={width - 10} y={y(price) + 4} textAnchor="end" className="last-price-text">{price.toFixed(2)}</text>
         {cursor && <g className="chart-crosshair" aria-hidden="true">
           <line x1={cursor.x} x2={cursor.x} y1={pad.top} y2={height - pad.bottom} />
           <line x1={pad.left} x2={width - pad.right} y1={cursor.y} y2={cursor.y} />
@@ -270,14 +328,14 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
           <rect x={cursorPriceLabelX} y={cursor.y - 11} width={cursorPriceLabelWidth} height="22" rx="4" />
           <text x={cursorPriceLabelX + cursorPriceLabelWidth - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
           <rect x={Math.min(width - pad.right - 70, Math.max(pad.left, cursor.x - 35))} y={height - pad.bottom + 7} width="70" height="22" rx="4" />
-          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{candles[cursor.index].time} ET</text>
+          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{cursor.time} ET</text>
         </g>}
       </svg>
       <output id="chart-cursor-readout" className="sr-only" aria-live="polite">
-        {cursor ? `${candles[cursor.index].time} Eastern Time, price ${money.format(cursor.price)}${cursor.locked ? ", crosshair pinned" : ""}.` : "No chart coordinate selected."}
+        {cursor ? `${cursor.time} Eastern Time, price ${money.format(cursor.price)}${cursor.locked ? ", crosshair pinned" : ""}.` : "No chart coordinate selected."}
       </output>
       <details className="chart-data-table">
-        <summary>View latest OHLC data ({hasHistoricalData ? "ET" : "simulated ET sample"})</summary>
+        <summary>View latest OHLC data ({hasMarketData ? "ET" : "simulated ET sample"})</summary>
         <div className="table-scroll">
           <table>
             <thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
@@ -513,7 +571,11 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           bidPrice?: number;
           askPrice?: number;
           price?: number;
+          open?: number;
+          high?: number;
+          low?: number;
           close?: number;
+          volume?: number;
           connected?: boolean;
           status?: string;
           live?: boolean;
@@ -558,11 +620,16 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           return;
         }
         if (event.type === "historicalBars" && event.symbol === activeSymbolRef.current && Array.isArray(event.bars)) {
-          mergeHistoricalBars(event.symbol, event.bars);
-          setChartRevision((current) => current + 1);
+          if (mergeHistoricalBars(event.symbol, event.bars)) {
+            setChartRevision((current) => current + 1);
+          }
           return;
         }
-        if (pausedRef.current || event.symbol !== activeSymbolRef.current) return;
+        if (event.symbol !== activeSymbolRef.current) return;
+        if ((event.type === "bar" || event.type === "updatedBar") && mergeLiveBar(event.symbol, event) && !pausedRef.current) {
+          setChartRevision((current) => current + 1);
+        }
+        if (pausedRef.current) return;
         const fallbackStatus = event.dataStatus ?? (event.stale ? "STALE" : "SNAPSHOT");
         setMarketData((current) => ({
           ...current,
