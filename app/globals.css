@@ -218,6 +218,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .watchlist-row:hover, .watchlist-row.active { background: #101a2d; }
 .watchlist-row.active::before { content: ""; position: absolute; inset: 7px auto 7px 0; width: 3px; border-radius: 0 3px 3px 0; background: var(--info); }
 .watchlist-row strong, .watchlist-row small { display: block; }
+.watchlist-row > span:first-child { min-width: 0; overflow: hidden; }
 .watchlist-row strong { font-family: var(--font-mono); font-size: 0.82rem; }
 .watchlist-row small { margin-top: 3px; overflow: hidden; color: #70839d; font-size: 0.67rem; text-overflow: ellipsis; white-space: nowrap; }
 .watchlist-row > span:not(:first-child) { text-align: right; font-size: 0.7rem; }
@@ -272,7 +273,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .market-data-detail.unavailable, .market-data-detail.error { color: #fda4af; border-color: #713044; background: #2b101b; }
 .ohlc-strip .stale-warning { margin-left: 0; color: #fcd34d; white-space: nowrap; }
 .chart-shell { min-width: 0; max-width: 100%; padding: 0 9px 7px; }
-.price-chart { width: 100%; height: clamp(260px, 36vh, 390px); display: block; overflow: visible; }
+.chart-context { min-height: 28px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 8px 0; color: #7187a3; font-family: var(--font-mono); font-size: 0.62rem; }
+.chart-context span:last-child { text-align: right; }
+.price-chart { width: 100%; height: clamp(260px, 36vh, 390px); display: block; overflow: visible; cursor: crosshair; }
+.price-chart:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
 .chart-grid { stroke: #17243a; stroke-width: 1; }
 .chart-axis { fill: #586c89; font-family: var(--font-mono); font-size: 10px; }
 .candle-positive { stroke: #35d49a; fill: #35d49a; }
@@ -281,6 +285,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .last-price-line { stroke: #35d49a; stroke-width: 1; stroke-dasharray: 4 4; opacity: 0.7; }
 .last-price-label { fill: #35d49a; }
 .last-price-text { fill: #04110c; font-family: var(--font-mono); font-size: 10px; font-weight: 700; }
+.chart-crosshair { pointer-events: none; }
+.chart-crosshair line { stroke: #8db5d2; stroke-width: 1; stroke-dasharray: 4 4; }
+.chart-crosshair circle { fill: #07111f; stroke: #d5ecfb; stroke-width: 1.5; }
+.chart-crosshair rect { fill: #13243a; stroke: #42617f; stroke-width: 1; }
+.chart-crosshair text { fill: #eff8ff; font-family: var(--font-mono); font-size: 10px; font-weight: 700; }
 .chart-data-table { min-width: 0; max-width: 100%; margin: 0 8px 4px; color: var(--muted); font-size: 0.72rem; }
 .chart-data-table summary { width: fit-content; padding: 6px 0; color: #8195af; }
 
@@ -398,6 +407,8 @@ td small { margin-top: 3px; color: #637a98; font-family: var(--font-sans); font-
   .quote-identity p { max-width: 165px; }
   .quote-price strong { font-size: 1.35rem; }
   .ohlc-strip { gap: 8px; overflow-x: auto; }
+  .chart-context { align-items: flex-start; flex-direction: column; gap: 2px; }
+  .chart-context span:last-child { text-align: left; }
   .segmented-control button { padding: 0 11px; }
 }
 

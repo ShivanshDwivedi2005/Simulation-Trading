@@ -53,6 +53,7 @@ const fallbackInstruments: Record<SymbolKey, Instrument> = {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/market";
+const MARKET_TIME_ZONE = "America/New_York";
 
 const intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
 const marketDataStatuses = new Set<MarketDataStatus>([
@@ -109,7 +110,12 @@ function mergeHistoricalBars(symbol: string, rawBars: unknown[]) {
     byTimestamp.set(bar.t, {
       time: Number.isNaN(timestamp.getTime())
         ? bar.t
-        : timestamp.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
+        : timestamp.toLocaleTimeString("en-US", {
+          hour: "2-digit",
+          minute: "2-digit",
+          hour12: false,
+          timeZone: MARKET_TIME_ZONE,
+        }),
       open: Number(bar.o),
       high: Number(bar.h),
       low: Number(bar.l),
@@ -125,13 +131,22 @@ function lastUpdateLabel(timestamp: string | null) {
   if (!timestamp) return "No update yet";
   const value = new Date(timestamp);
   if (Number.isNaN(value.getTime())) return "Update time unavailable";
-  return `Updated ${value.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+  return `Updated ${value.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: MARKET_TIME_ZONE,
+    timeZoneName: "short",
+  })}`;
 }
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 
 function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; chartType: string; paused: boolean; price: number }) {
+  const [cursor, setCursor] = useState<{ x: number; y: number; index: number; price: number; locked: boolean } | null>(null);
   const candles = candlesFor(symbol, price);
   const width = 960;
   const height = 350;
@@ -147,11 +162,70 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
   const areaPoints = `${pad.left},${height - pad.bottom} ${points} ${width - pad.right},${height - pad.bottom}`;
   const gridValues = Array.from({ length: 5 }, (_, index) => min + ((max - min) * index) / 4).reverse();
   const last = candles.at(-1)!;
+  const tickIndexes = Array.from(new Set([0, 0.25, 0.5, 0.75, 1].map((position) => Math.round(position * (candles.length - 1)))));
+  const hasHistoricalData = dynamicCandleSets.has(symbol);
+
+  function cursorFromPoint(clientX: number, clientY: number, locked: boolean, target: SVGSVGElement) {
+    const bounds = target.getBoundingClientRect();
+    const svgX = ((clientX - bounds.left) / bounds.width) * width;
+    const svgY = ((clientY - bounds.top) / bounds.height) * height;
+    const cursorX = Math.min(width - pad.right, Math.max(pad.left, svgX));
+    const cursorY = Math.min(height - pad.bottom, Math.max(pad.top, svgY));
+    const index = Math.min(
+      candles.length - 1,
+      Math.max(0, Math.round(((cursorX - pad.left) / innerWidth) * (candles.length - 1))),
+    );
+    const cursorPrice = max - ((cursorY - pad.top) / innerHeight) * (max - min);
+    setCursor({ x: cursorX, y: cursorY, index, price: cursorPrice, locked });
+  }
+
+  function handleChartKeyDown(event: React.KeyboardEvent<SVGSVGElement>) {
+    if (event.key === "Escape") {
+      setCursor(null);
+      return;
+    }
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", " "].includes(event.key)) return;
+    event.preventDefault();
+    const currentIndex = cursor?.index ?? candles.length - 1;
+    const currentPrice = cursor?.price ?? candles[currentIndex].close;
+    const nextIndex = event.key === "ArrowLeft"
+      ? Math.max(0, currentIndex - 1)
+      : event.key === "ArrowRight"
+        ? Math.min(candles.length - 1, currentIndex + 1)
+        : currentIndex;
+    const priceStep = (max - min) / 100;
+    const nextPrice = event.key === "ArrowUp"
+      ? Math.min(max, currentPrice + priceStep)
+      : event.key === "ArrowDown"
+        ? Math.max(min, currentPrice - priceStep)
+        : currentPrice;
+    setCursor({ x: x(nextIndex), y: y(nextPrice), index: nextIndex, price: nextPrice, locked: true });
+  }
 
   return (
     <div className="chart-shell" aria-label={`${symbol} price chart. Last price ${money.format(price)}. ${paused ? "Live updates paused." : "Live updates active."}`}>
-      <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with fifty-four simulated OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}.</p>
-      <svg className="price-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${symbol} intraday ${chartType.toLowerCase()} price chart`}>
+      <div className="chart-context">
+        <span>{hasHistoricalData ? "Historical market data" : "Simulated sample data"} · Times shown in ET</span>
+        <span>Move to inspect · Click to pin · Esc to clear</span>
+      </div>
+      <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with {candles.length} OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}. Use arrow keys to inspect time and price coordinates.</p>
+      <svg
+        className="price-chart"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        tabIndex={0}
+        aria-label={`${symbol} intraday ${chartType.toLowerCase()} price chart. Interactive crosshair available.`}
+        aria-describedby="chart-cursor-readout"
+        onPointerMove={(event) => {
+          if (!cursor?.locked) cursorFromPoint(event.clientX, event.clientY, false, event.currentTarget);
+        }}
+        onPointerDown={(event) => {
+          event.currentTarget.focus();
+          cursorFromPoint(event.clientX, event.clientY, true, event.currentTarget);
+        }}
+        onPointerLeave={() => setCursor((current) => current?.locked ? current : null)}
+        onKeyDown={handleChartKeyDown}
+      >
         <defs>
           <linearGradient id="area-fill" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="#38bdf8" stopOpacity="0.3" />
@@ -164,8 +238,8 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
             <text x={width - pad.right + 10} y={y(value) + 4} className="chart-axis">{value.toFixed(2)}</text>
           </g>
         ))}
-        {[0, 13, 26, 39, 53].map((index) => (
-          <text key={index} x={x(index)} y={height - 14} textAnchor={index === 0 ? "start" : index === 53 ? "end" : "middle"} className="chart-axis">
+        {tickIndexes.map((index) => (
+          <text key={index} x={x(index)} y={height - 14} textAnchor={index === 0 ? "start" : index === candles.length - 1 ? "end" : "middle"} className="chart-axis">
             {candles[index].time}
           </text>
         ))}
@@ -184,9 +258,21 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
         <line x1={pad.left} x2={width - pad.right} y1={y(last.close)} y2={y(last.close)} className="last-price-line" />
         <rect x={width - pad.right} y={y(last.close) - 11} width="58" height="22" rx="4" className="last-price-label" />
         <text x={width - 10} y={y(last.close) + 4} textAnchor="end" className="last-price-text">{price.toFixed(2)}</text>
+        {cursor && <g className="chart-crosshair" aria-hidden="true">
+          <line x1={cursor.x} x2={cursor.x} y1={pad.top} y2={height - pad.bottom} />
+          <line x1={pad.left} x2={width - pad.right} y1={cursor.y} y2={cursor.y} />
+          <circle cx={cursor.x} cy={cursor.y} r="4" />
+          <rect x={width - pad.right} y={cursor.y - 11} width="64" height="22" rx="4" />
+          <text x={width - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
+          <rect x={Math.min(width - pad.right - 70, Math.max(pad.left, cursor.x - 35))} y={height - pad.bottom + 7} width="70" height="22" rx="4" />
+          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{candles[cursor.index].time} ET</text>
+        </g>}
       </svg>
+      <output id="chart-cursor-readout" className="sr-only" aria-live="polite">
+        {cursor ? `${candles[cursor.index].time} Eastern Time, price ${money.format(cursor.price)}${cursor.locked ? ", crosshair pinned" : ""}.` : "No chart coordinate selected."}
+      </output>
       <details className="chart-data-table">
-        <summary>View latest OHLC data</summary>
+        <summary>View latest OHLC data ({hasHistoricalData ? "ET" : "simulated ET sample"})</summary>
         <div className="table-scroll">
           <table>
             <thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
@@ -719,8 +805,8 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           <div className="watchlist-items">
             {(Object.keys(instruments) as SymbolKey[]).map((key) => {
               const item = instruments[key];
-              return <button key={key} className={`watchlist-row ${key === symbol ? "active" : ""}`} onClick={() => { selectInstrument(key); setMobileWatchlist(false); }}>
-                <span><strong>{key}</strong><small>{item.name}</small></span>
+              return <button key={key} className={`watchlist-row ${key === symbol ? "active" : ""}`} aria-label={`${key}, ${item.name}, last price ${item.price.toFixed(2)}`} onClick={() => { selectInstrument(key); setMobileWatchlist(false); }}>
+                <span><strong>{key}</strong><small title={item.name}>{item.name}</small></span>
                 <span className="numeric">{item.price.toFixed(2)}</span>
                 <span className={`numeric ${item.change >= 0 ? "positive" : "negative"}`}>{item.change >= 0 ? "+" : ""}{item.change.toFixed(2)}%</span>
               </button>;
@@ -753,7 +839,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               {marketData.stale && <em className="stale-warning">Stale data · orders require a fresh price</em>}
               {paused && <em>Paused</em>}
             </div>
-            <PriceChart symbol={symbol} chartType={chartType} paused={paused} price={quote.price} />
+            <PriceChart key={`${symbol}-${chartType}`} symbol={symbol} chartType={chartType} paused={paused} price={quote.price} />
           </div>
 
           <section className="activity-panel">
