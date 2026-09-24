@@ -23,6 +23,15 @@ type Candle = { time: string; open: number; high: number; low: number; close: nu
 type Position = { symbol: SymbolKey; quantity: number; averagePrice: number };
 type Instrument = { name: string; exchange: string; price: number; change: number; bid: number; ask: number };
 type CatalogueInstrument = { symbol: string; name: string; exchange: string; tradable: boolean; fractionable: boolean };
+type MarketDataStatus = "CONNECTING" | "LIVE" | "QUEUED" | "SNAPSHOT" | "STALE" | "UNAVAILABLE" | "ERROR";
+type MarketDataState = {
+  status: MarketDataStatus;
+  message: string;
+  queuePosition: number | null;
+  lastUpdatedAt: string | null;
+  source: string | null;
+  stale: boolean;
+};
 type Order = {
   id: string;
   symbol: SymbolKey;
@@ -46,6 +55,9 @@ const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/market";
 
 const intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
+const marketDataStatuses = new Set<MarketDataStatus>([
+  "CONNECTING", "LIVE", "QUEUED", "SNAPSHOT", "STALE", "UNAVAILABLE", "ERROR",
+]);
 
 function buildCandles(base: number, seed: number): Candle[] {
   let previous = base - 3.8;
@@ -78,13 +90,42 @@ const candleSets: Record<SymbolKey, Candle[]> = {
 const dynamicCandleSets = new Map<string, Candle[]>();
 
 function candlesFor(symbol: string, price: number) {
-  if (candleSets[symbol]) return candleSets[symbol];
   const existing = dynamicCandleSets.get(symbol);
   if (existing) return existing;
+  if (candleSets[symbol]) return candleSets[symbol];
   const seed = Array.from(symbol).reduce((sum, character) => sum + character.charCodeAt(0), 0);
   const candles = buildCandles(price > 0 ? price : 100, seed);
   dynamicCandleSets.set(symbol, candles);
   return candles;
+}
+
+function mergeHistoricalBars(symbol: string, rawBars: unknown[]) {
+  const byTimestamp = new Map<string, Candle>();
+  for (const raw of rawBars) {
+    if (!raw || typeof raw !== "object") continue;
+    const bar = raw as { t?: string; o?: number; h?: number; l?: number; c?: number; v?: number };
+    if (!bar.t || ![bar.o, bar.h, bar.l, bar.c, bar.v].every((value) => Number.isFinite(Number(value)))) continue;
+    const timestamp = new Date(bar.t);
+    byTimestamp.set(bar.t, {
+      time: Number.isNaN(timestamp.getTime())
+        ? bar.t
+        : timestamp.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
+      open: Number(bar.o),
+      high: Number(bar.h),
+      low: Number(bar.l),
+      close: Number(bar.c),
+      volume: Number(bar.v),
+    });
+  }
+  const merged = Array.from(byTimestamp.values()).slice(-200);
+  if (merged.length > 1) dynamicCandleSets.set(symbol, merged);
+}
+
+function lastUpdateLabel(timestamp: string | null) {
+  if (!timestamp) return "No update yet";
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return "Update time unavailable";
+  return `Updated ${value.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
 }
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
@@ -181,17 +222,27 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   const [notice, setNotice] = useState("");
   const [mobileWatchlist, setMobileWatchlist] = useState(false);
   const [instruments, setInstruments] = useState(fallbackInstruments);
-  const [marketDataStatus, setMarketDataStatus] = useState("Connecting to Alpaca…");
+  const [marketData, setMarketData] = useState<MarketDataState>({
+    status: "CONNECTING",
+    message: "Connecting to Alpaca…",
+    queuePosition: null,
+    lastUpdatedAt: null,
+    source: null,
+    stale: false,
+  });
+  const [, setChartRevision] = useState(0);
   const [instrumentQuery, setInstrumentQuery] = useState("AAPL · Apple Inc.");
   const [searchResults, setSearchResults] = useState<CatalogueInstrument[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
+  const marketDataStatusRef = useRef<MarketDataStatus>("CONNECTING");
   const subscribedSymbolRef = useRef(symbol);
   const activeSymbolRef = useRef(symbol);
   const pausedRef = useRef(paused);
-  const displayedMarketDataStatus = paused ? "Quote updates paused" : marketDataStatus;
+  const displayedMarketDataStatus = paused ? "Quote updates paused" : marketData.message;
+  const marketDataTone = marketData.status.toLowerCase();
 
   const quote = instruments[symbol];
   const positionsValue = useMemo(
@@ -268,7 +319,16 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     async function loadQuote() {
       try {
         const response = await fetch(`${API_URL}/api/v1/market/${symbol}/quote`, { signal: controller.signal });
-        const result = await response.json() as { last?: number; bid?: number; ask?: number; feed?: string; message?: string };
+        const result = await response.json() as {
+          last?: number;
+          bid?: number;
+          ask?: number;
+          feed?: string;
+          message?: string;
+          timestamp?: string;
+          source?: string;
+          stale?: boolean;
+        };
         if (!response.ok) throw new Error(result.message ?? "quote_request_failed");
         setInstruments((current) => ({
           ...current,
@@ -279,9 +339,23 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
             ask: Number(result.ask),
           },
         }));
+        setMarketData((current) => ({
+          ...current,
+          status: current.status === "LIVE" || current.status === "QUEUED"
+            ? current.status
+            : result.stale ? "STALE" : "SNAPSHOT",
+          message: current.status === "LIVE" || current.status === "QUEUED"
+            ? current.message
+            : result.stale ? "Latest snapshot is stale." : "Latest Alpaca snapshot is shown.",
+          lastUpdatedAt: result.timestamp ?? current.lastUpdatedAt,
+          source: result.source ?? "alpaca_rest_snapshot",
+          stale: Boolean(result.stale),
+        }));
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
-        setMarketDataStatus("Alpaca quote unavailable");
+        setMarketData((current) => current.status === "LIVE" || current.status === "QUEUED"
+          ? current
+          : { ...current, status: "UNAVAILABLE", message: "Alpaca quote unavailable" });
       }
     }
     void loadQuote();
@@ -321,6 +395,10 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   }, [paused, symbol]);
 
   useEffect(() => {
+    marketDataStatusRef.current = marketData.status;
+  }, [marketData.status]);
+
+  useEffect(() => {
     let stopped = false;
     let reconnectTimer = 0;
     let reconnectDelay = 1_000;
@@ -329,13 +407,13 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       if (stopped) return;
       const socket = new WebSocket(WS_URL);
       socketRef.current = socket;
-      setMarketDataStatus("Connecting to Alpaca stream…");
+      setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Connecting to Alpaca stream…", queuePosition: null }));
       socket.onopen = () => {
         reconnectDelay = 1_000;
         const currentSymbol = activeSymbolRef.current;
         subscribedSymbolRef.current = currentSymbol;
         socket.send(JSON.stringify({ action: "watch", symbol: currentSymbol }));
-        setMarketDataStatus("Alpaca IEX stream connected");
+        setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Requesting live market data…" }));
       };
       socket.onmessage = (message) => {
         let event: {
@@ -349,6 +427,12 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           status?: string;
           live?: boolean;
           message?: string;
+          queuePosition?: number | null;
+          timestamp?: string;
+          source?: string;
+          stale?: boolean;
+          dataStatus?: "SNAPSHOT" | "STALE";
+          bars?: unknown[];
         };
         try {
           event = JSON.parse(String(message.data));
@@ -356,29 +440,72 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           return;
         }
         if (event.type === "error") {
-          setMarketDataStatus(event.message ?? "Market stream error");
+          setMarketData((current) => ({ ...current, status: "ERROR", message: event.message ?? "Market stream error" }));
           return;
         }
         if (event.type === "market_data_status" && event.symbol === activeSymbolRef.current) {
-          if (event.status === "CAPACITY_FULL") {
-            setMarketDataStatus(event.message ?? "All live market-data slots are currently in use.");
-          } else if (event.live) {
-            setMarketDataStatus("Alpaca IEX stream connected");
-          } else {
-            setMarketDataStatus(event.message ?? "Live market data subscription pending…");
+          const nextStatus = marketDataStatuses.has(event.status as MarketDataStatus)
+            ? event.status as MarketDataStatus
+            : event.live ? "LIVE" : "ERROR";
+          if (nextStatus === "LIVE" && marketDataStatusRef.current !== "LIVE") {
+            setNotice(`${event.symbol} live market data is now connected.`);
           }
+          marketDataStatusRef.current = nextStatus;
+          setMarketData((current) => ({
+              ...current,
+              status: nextStatus,
+              message: event.message ?? (nextStatus === "LIVE" ? "Live market data connected." : "Market data status changed."),
+              queuePosition: typeof event.queuePosition === "number" ? event.queuePosition : null,
+              stale: nextStatus === "STALE" ? true : nextStatus === "LIVE" ? false : current.stale,
+          }));
           return;
         }
         if (event.type === "status" && event.symbol === activeSymbolRef.current) {
-          setMarketDataStatus(event.connected ? "Alpaca IEX stream connected" : "Alpaca stream reconnecting…");
+          if (!event.connected) {
+            setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Alpaca stream reconnecting…" }));
+          }
+          return;
+        }
+        if (event.type === "historicalBars" && event.symbol === activeSymbolRef.current && Array.isArray(event.bars)) {
+          mergeHistoricalBars(event.symbol, event.bars);
+          setChartRevision((current) => current + 1);
           return;
         }
         if (pausedRef.current || event.symbol !== activeSymbolRef.current) return;
+        const fallbackStatus = event.dataStatus ?? (event.stale ? "STALE" : "SNAPSHOT");
+        setMarketData((current) => ({
+          ...current,
+          status: event.live
+            ? "LIVE"
+            : current.status === "QUEUED" || current.status === "CONNECTING" || current.status === "LIVE"
+              ? current.status
+              : fallbackStatus,
+          message: event.live
+            ? "Live market data connected."
+            : current.status === "QUEUED" || current.status === "CONNECTING" || current.status === "LIVE"
+              ? current.message
+              : event.stale ? "Cached market data is stale." : "Latest available snapshot is shown.",
+          queuePosition: event.live ? null : current.queuePosition,
+          lastUpdatedAt: event.timestamp ?? current.lastUpdatedAt,
+          source: event.source ?? (event.live ? "alpaca_websocket" : current.source),
+          stale: Boolean(event.stale),
+        }));
         if (event.type === "quote") {
           setInstruments((current) => ({
             ...current,
             [event.symbol!]: {
               ...current[event.symbol!],
+              bid: Number(event.bidPrice ?? current[event.symbol!].bid),
+              ask: Number(event.askPrice ?? current[event.symbol!].ask),
+            },
+          }));
+        } else if (event.type === "snapshot") {
+          const nextPrice = Number(event.price);
+          setInstruments((current) => ({
+            ...current,
+            [event.symbol!]: {
+              ...current[event.symbol!],
+              price: Number.isFinite(nextPrice) ? nextPrice : current[event.symbol!].price,
               bid: Number(event.bidPrice ?? current[event.symbol!].bid),
               ask: Number(event.askPrice ?? current[event.symbol!].ask),
             },
@@ -395,7 +522,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       socket.onclose = () => {
         if (socketRef.current === socket) socketRef.current = null;
         if (stopped) return;
-        setMarketDataStatus("Alpaca stream reconnecting…");
+        setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Alpaca stream reconnecting…" }));
         reconnectTimer = window.setTimeout(connect, reconnectDelay);
         reconnectDelay = Math.min(15_000, reconnectDelay * 2);
       };
@@ -419,7 +546,17 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     const socket = socketRef.current;
     const previous = subscribedSymbolRef.current;
     activeSymbolRef.current = symbol;
-    if (!socket || socket.readyState !== WebSocket.OPEN || previous === symbol) return;
+    if (previous === symbol) return;
+    marketDataStatusRef.current = "CONNECTING";
+    setMarketData({
+      status: "CONNECTING",
+      message: `Requesting ${symbol} market data…`,
+      queuePosition: null,
+      lastUpdatedAt: null,
+      source: null,
+      stale: false,
+    });
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
     socket.send(JSON.stringify({ action: "unwatch", symbol: previous }));
     socket.send(JSON.stringify({ action: "watch", symbol }));
     subscribedSymbolRef.current = symbol;
@@ -566,7 +703,10 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           </div>}
         </label>
         <div className="topbar-actions">
-          <span className="market-status"><i aria-hidden="true" /> <b>{displayedMarketDataStatus}</b></span>
+          <span className={`market-status ${marketDataTone}`} role="status" aria-atomic="true">
+            <i aria-hidden="true" />
+            <b>{marketData.status}{marketData.status === "QUEUED" && marketData.queuePosition ? ` · #${marketData.queuePosition}` : ""}</b>
+          </span>
           <button className="icon-button" aria-label="Notifications"><Bell aria-hidden="true" /><span className="notification-dot" /></button>
           <button className="account-button" onClick={onSignOut} aria-label={`Sign out ${userName}`} title="Sign out"><span>{userName.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "ST"}</span><div><strong>{userName}</strong><small>Demo account · Sign out</small></div><ChevronDown aria-hidden="true" /></button>
         </div>
@@ -587,7 +727,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
             })}
           </div>
           <button className="add-symbol" onClick={() => { searchInputRef.current?.focus(); setSearchOpen(true); }}><Search aria-hidden="true" /> Add symbol</button>
-          <div className="data-source"><ShieldCheck aria-hidden="true" /><span><strong>Alpaca market data</strong><small>{displayedMarketDataStatus}</small></span></div>
+          <div className={`data-source ${marketDataTone}`}><ShieldCheck aria-hidden="true" /><span><strong>Alpaca market data · {marketData.status}</strong><small>{displayedMarketDataStatus}</small><small>{lastUpdateLabel(marketData.lastUpdatedAt)}</small></span></div>
         </aside>
 
         <section className="main-workspace">
@@ -607,7 +747,12 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               <div className="interval-control" aria-label="Chart timeframe">{intervals.map((item) => <button key={item} className={interval === item ? "active" : ""} onClick={() => setIntervalValue(item)}>{item}</button>)}</div>
               <button className="icon-button" aria-label={paused ? "Resume live chart" : "Pause live chart"} aria-pressed={paused} onClick={() => setPaused((current) => !current)}>{paused ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}</button>
             </div>
-            <div className="ohlc-strip"><span>O <b>225.84</b></span><span>H <b>228.12</b></span><span>L <b>224.92</b></span><span>C <b className="positive">227.16</b></span><span>Vol <b>642.8K</b></span>{paused && <em>Paused</em>}</div>
+            <div className="ohlc-strip">
+              <span>O <b>225.84</b></span><span>H <b>228.12</b></span><span>L <b>224.92</b></span><span>C <b className="positive">227.16</b></span><span>Vol <b>642.8K</b></span>
+              <span className={`market-data-detail ${marketDataTone}`}>{marketData.status}{marketData.queuePosition ? ` · Queue #${marketData.queuePosition}` : ""} · {lastUpdateLabel(marketData.lastUpdatedAt)}</span>
+              {marketData.stale && <em className="stale-warning">Stale data · orders require a fresh price</em>}
+              {paused && <em>Paused</em>}
+            </div>
             <PriceChart symbol={symbol} chartType={chartType} paused={paused} price={quote.price} />
           </div>
 
@@ -642,7 +787,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           </section>
 
           <form className="order-ticket" onSubmit={submitOrder}>
-            <div className="ticket-heading"><div><small>ORDER TICKET</small><h2>{symbol}</h2></div><span className="live-badge"><i aria-hidden="true" /> LIVE</span></div>
+            <div className="ticket-heading"><div><small>ORDER TICKET</small><h2>{symbol}</h2></div><span className={`live-badge ${marketDataTone}`}><i aria-hidden="true" /> {marketData.status}</span></div>
             <div className="side-toggle"><button type="button" className={side === "BUY" ? "buy active" : "buy"} onClick={() => setSide("BUY")}>Buy</button><button type="button" className={side === "SELL" ? "sell active" : "sell"} onClick={() => setSide("SELL")}>Sell</button></div>
             <label className="field-label">Order type<select value={orderType} onChange={(event) => setOrderType(event.target.value)}><option>MARKET</option><option>LIMIT</option><option>STOP</option><option>STOP_LIMIT</option></select></label>
             <label className="field-label">Quantity<div className="input-with-unit"><input type="number" min="1" step="1" value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} /><span>Shares</span></div></label>

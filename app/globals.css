@@ -10,6 +10,7 @@
   --positive: #35d49a;
   --negative: #ff637d;
   --info: #38bdf8;
+  --warning: #fbbf24;
   --ring: #7dd3fc;
   --font-sans: "Segoe UI", Inter, system-ui, -apple-system, sans-serif;
   --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
@@ -182,6 +183,15 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .market-status { gap: 7px; color: #c2cee0; font-size: 0.8rem; }
 .market-status i, .live-badge i { width: 7px; height: 7px; border-radius: 50%; background: var(--positive); box-shadow: 0 0 0 4px rgba(53, 212, 154, 0.1); }
 .market-status b { color: var(--muted); font-family: var(--font-mono); font-weight: 500; }
+.market-status.live b { color: #86efc2; }
+.market-status.queued b, .market-status.snapshot b, .market-status.stale b { color: #fcd34d; }
+.market-status.connecting b { color: #7dd3fc; }
+.market-status.unavailable b, .market-status.error b { color: #fda4af; }
+.market-status.queued i, .market-status.snapshot i, .market-status.stale i,
+.live-badge.queued i, .live-badge.snapshot i, .live-badge.stale i { background: var(--warning); box-shadow: 0 0 0 4px rgba(251, 191, 36, 0.12); }
+.market-status.connecting i, .live-badge.connecting i { background: var(--info); box-shadow: 0 0 0 4px rgba(56, 189, 248, 0.12); }
+.market-status.unavailable i, .market-status.error i,
+.live-badge.unavailable i, .live-badge.error i { background: var(--negative); box-shadow: 0 0 0 4px rgba(255, 99, 125, 0.12); }
 .icon-button { position: relative; width: 40px; height: 40px; display: inline-grid; place-items: center; border: 1px solid var(--border); border-radius: 8px; color: #b8c8dc; background: var(--surface); transition: 150ms ease; }
 .icon-button:hover { color: white; border-color: #385174; background: var(--surface-soft); }
 .icon-button svg { width: 17px; }
@@ -216,6 +226,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .add-symbol svg { width: 15px; }
 .data-source { gap: 9px; margin: 18px 11px; padding: 10px; border: 1px solid var(--border-soft); border-radius: 8px; color: #8fa4bf; background: rgba(19, 28, 49, 0.5); }
 .data-source svg { width: 17px; color: var(--positive); }
+.data-source.queued svg, .data-source.snapshot svg, .data-source.stale svg { color: var(--warning); }
+.data-source.connecting svg { color: var(--info); }
+.data-source.unavailable svg, .data-source.error svg { color: var(--negative); }
 .data-source strong, .data-source small { display: block; }
 .data-source strong { color: #c9d6e7; font-size: 0.72rem; }
 .data-source small { margin-top: 2px; font-size: 0.65rem; }
@@ -253,6 +266,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .ohlc-strip { min-height: 32px; display: flex; align-items: center; gap: 13px; padding: 5px 17px; color: #6f85a3; font-family: var(--font-mono); font-size: 0.65rem; }
 .ohlc-strip b { color: #b7c5d8; font-weight: 500; }
 .ohlc-strip em { margin-left: auto; padding: 2px 7px; border-radius: 4px; color: #fbd38d; background: rgba(245, 158, 11, 0.12); font-style: normal; }
+.market-data-detail { margin-left: auto; padding: 3px 7px; border: 1px solid #29445f; border-radius: 5px; color: #a8cde4; white-space: nowrap; }
+.market-data-detail.live { color: #86efc2; border-color: #1c6b52; background: #0a2b24; }
+.market-data-detail.queued, .market-data-detail.snapshot, .market-data-detail.stale { color: #fcd34d; border-color: #725718; background: #2a220d; }
+.market-data-detail.unavailable, .market-data-detail.error { color: #fda4af; border-color: #713044; background: #2b101b; }
+.ohlc-strip .stale-warning { margin-left: 0; color: #fcd34d; white-space: nowrap; }
 .chart-shell { min-width: 0; max-width: 100%; padding: 0 9px 7px; }
 .price-chart { width: 100%; height: clamp(260px, 36vh, 390px); display: block; overflow: visible; }
 .chart-grid { stroke: #17243a; stroke-width: 1; }
@@ -303,6 +321,9 @@ td small { margin-top: 3px; color: #637a98; font-family: var(--font-sans); font-
 .order-ticket { margin-top: 10px; padding: 14px; }
 .ticket-heading { justify-content: space-between; }
 .live-badge { display: flex; align-items: center; gap: 7px; padding: 5px 8px; border-radius: 6px; color: #86efc2; background: #0c2a22; font-size: 0.63rem; font-weight: 700; }
+.live-badge.queued, .live-badge.snapshot, .live-badge.stale { color: #fcd34d; background: #2a220d; }
+.live-badge.connecting { color: #7dd3fc; background: #0b2636; }
+.live-badge.unavailable, .live-badge.error { color: #fda4af; background: #2b101b; }
 .side-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 14px; padding: 3px; border: 1px solid var(--border); border-radius: 8px; background: var(--background); }
 .side-toggle button { min-height: 38px; border: 0; border-radius: 5px; color: #8195ae; background: transparent; font-size: 0.8rem; font-weight: 700; }
 .side-toggle .buy.active { color: #65e7b5; background: #0f332a; box-shadow: inset 0 0 0 1px #1d684f; }
