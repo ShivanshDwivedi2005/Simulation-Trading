@@ -7,6 +7,7 @@
 #include <ctime>
 #include <curl/curl.h>
 #include <iomanip>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -17,6 +18,9 @@ namespace {
 
 constexpr auto kMinimumRequestInterval = std::chrono::milliseconds(100);
 constexpr auto kSnapshotFreshness = std::chrono::seconds(30);
+constexpr auto kHistoricalLookback = std::chrono::hours(24 * 8);
+constexpr int kRegularSessionOpenMinute = 9 * 60 + 30;
+constexpr int kRegularSessionCloseMinute = 16 * 60;
 
 std::size_t append_response(char *data, std::size_t size, std::size_t count,
                             void *target) {
@@ -52,6 +56,72 @@ parse_timestamp(const std::string &timestamp) {
   if (seconds < 0)
     return std::nullopt;
   return std::chrono::system_clock::from_time_t(seconds);
+}
+
+std::tm utc_parts(std::chrono::system_clock::time_point value) {
+  const auto seconds = std::chrono::system_clock::to_time_t(value);
+  std::tm result{};
+#ifdef _WIN32
+  gmtime_s(&result, &seconds);
+#else
+  gmtime_r(&seconds, &result);
+#endif
+  return result;
+}
+
+std::chrono::system_clock::time_point utc_time(int year, int month, int day,
+                                               int hour) {
+  std::tm value{};
+  value.tm_year = year - 1900;
+  value.tm_mon = month - 1;
+  value.tm_mday = day;
+  value.tm_hour = hour;
+#ifdef _WIN32
+  const auto seconds = _mkgmtime(&value);
+#else
+  const auto seconds = timegm(&value);
+#endif
+  return std::chrono::system_clock::from_time_t(seconds);
+}
+
+int first_sunday(int year, int month) {
+  const auto first = utc_parts(utc_time(year, month, 1, 0));
+  return 1 + ((7 - first.tm_wday) % 7);
+}
+
+bool eastern_daylight_time(std::chrono::system_clock::time_point timestamp) {
+  const auto utc = utc_parts(timestamp);
+  const int year = utc.tm_year + 1900;
+  const int second_sunday_in_march = first_sunday(year, 3) + 7;
+  const int first_sunday_in_november = first_sunday(year, 11);
+  const auto daylight_start = utc_time(year, 3, second_sunday_in_march, 7);
+  const auto daylight_end = utc_time(year, 11, first_sunday_in_november, 6);
+  return timestamp >= daylight_start && timestamp < daylight_end;
+}
+
+struct EasternTimestamp {
+  std::string date;
+  int minute_of_day;
+};
+
+std::optional<EasternTimestamp>
+eastern_timestamp(const std::string &timestamp) {
+  const auto parsed = parse_timestamp(timestamp);
+  if (!parsed)
+    return std::nullopt;
+  const auto offset = eastern_daylight_time(*parsed) ? std::chrono::hours(-4)
+                                                      : std::chrono::hours(-5);
+  const auto local = utc_parts(*parsed + offset);
+  std::ostringstream date;
+  date << std::put_time(&local, "%Y-%m-%d");
+  return EasternTimestamp{date.str(), local.tm_hour * 60 + local.tm_min};
+}
+
+std::string utc_date(std::chrono::system_clock::time_point value) {
+  const auto parts = utc_parts(value);
+  std::ostringstream output;
+  output << std::put_time(&parts, "%Y-%m-%d");
+  return output.str();
 }
 
 } // namespace
@@ -138,17 +208,33 @@ MarketDataRestClient::historical_bars(const std::string &raw_symbol,
   const auto symbol = normalize_symbol(raw_symbol);
   if (!valid_symbol(symbol))
     throw std::runtime_error("invalid_symbol");
-  limit = std::clamp<std::size_t>(limit, 1, 1000);
+  limit = std::clamp<std::size_t>(limit, 1, 10000);
   auto base_url = config_.alpaca_data_rest_url;
   while (!base_url.empty() && base_url.back() == '/')
     base_url.pop_back();
+  const auto start = utc_date(std::chrono::system_clock::now() -
+                              kHistoricalLookback);
   auto response =
       authenticated_get(base_url + "/v2/stocks/" + symbol +
                         "/bars?timeframe=1Min&limit=" + std::to_string(limit) +
-                        "&feed=" + config_.alpaca_data_feed);
+                        "&start=" + start + "&sort=asc&adjustment=raw&feed=" +
+                        config_.alpaca_data_feed);
+  response["bars"] = latest_regular_session_bars(
+      response.value("bars", nlohmann::json::array()));
   response["symbol"] = symbol;
   response["source"] = "alpaca_rest_historical";
   response["live"] = false;
+  response["timeZone"] = "America/New_York";
+  response["sessionOpen"] = "09:30";
+  response["sessionClose"] = "16:00";
+  response["expectedSessionMinutes"] = 390;
+  if (!response["bars"].empty()) {
+    const auto session = eastern_timestamp(
+        response["bars"].front().value("t", ""));
+    response["sessionDate"] = session ? session->date : "";
+  } else {
+    response["sessionDate"] = "";
+  }
   return response;
 }
 
@@ -222,6 +308,36 @@ bool market_data_timestamp_is_fresh(const std::string &timestamp,
   if (!parsed || *parsed > now + std::chrono::seconds(5))
     return false;
   return now - *parsed <= maximum_age;
+}
+
+nlohmann::json latest_regular_session_bars(const nlohmann::json &bars) {
+  if (!bars.is_array())
+    return nlohmann::json::array();
+
+  std::string latest_session;
+  std::map<std::string, nlohmann::json> selected;
+  for (const auto &bar : bars) {
+    if (!bar.is_object())
+      continue;
+    const auto timestamp = bar.value("t", "");
+    const auto eastern = eastern_timestamp(timestamp);
+    if (!eastern || eastern->minute_of_day < kRegularSessionOpenMinute ||
+        eastern->minute_of_day >= kRegularSessionCloseMinute)
+      continue;
+    if (eastern->date > latest_session) {
+      latest_session = eastern->date;
+      selected.clear();
+    }
+    if (eastern->date == latest_session)
+      selected.insert_or_assign(timestamp, bar);
+  }
+
+  nlohmann::json result = nlohmann::json::array();
+  for (const auto &[timestamp, bar] : selected) {
+    static_cast<void>(timestamp);
+    result.push_back(bar);
+  }
+  return result;
 }
 
 } // namespace simtrade::market
