@@ -65,10 +65,13 @@ class FakeViewerSink final : public simtrade::market::ViewerSubscriptionSink {
     watches.push_back(symbol);
     return result;
   }
+  simtrade::market::WatchResult refresh(const std::string& symbol) override {
+    touches.push_back(symbol);
+    return result;
+  }
   void unwatch(const std::string& symbol) override { unwatches.push_back(symbol); }
-  void touch(const std::string& symbol) override { touches.push_back(symbol); }
 
-  simtrade::market::WatchResult result{simtrade::market::WatchResult::live};
+  simtrade::market::WatchResult result{simtrade::market::WatchState::live, std::nullopt};
   std::vector<std::string> watches;
   std::vector<std::string> unwatches;
   std::vector<std::string> touches;
@@ -77,6 +80,8 @@ class FakeViewerSink final : public simtrade::market::ViewerSubscriptionSink {
 std::vector<std::string> pinned_symbols() { return {"PIN0", "PIN1", "PIN2", "PIN3", "PIN4"}; }
 
 void confirm_desired(simtrade::market::SubscriptionManager& manager, FakeUpstream& upstream) {
+  manager.on_connection_changed(true);
+  static_cast<void>(manager.snapshot());
   const auto desired = upstream.registry.desired();
   upstream.registry.confirm({{"T", "subscription"},
                              {"trades", desired},
@@ -137,12 +142,13 @@ void test_pinned_and_dynamic_capacity() {
         "all five configured symbols remain pinned");
 
   for (int index = 0; index < 25; ++index) {
-    check(manager.watch(std::string("D") + std::to_string(index)) == simtrade::market::WatchResult::pending,
+    check(manager.watch(std::string("D") + std::to_string(index)).state == simtrade::market::WatchState::connecting,
           "each of the 25 dynamic slots is available");
   }
   check(manager.active_symbol_count() == 30, "five pinned and 25 dynamic symbols consume all 30 slots");
-  check(manager.watch("D25") == simtrade::market::WatchResult::capacity_full,
-        "a 26th actively viewed dynamic symbol receives CAPACITY_FULL");
+  const auto queued = manager.watch("D25");
+  check(queued.state == simtrade::market::WatchState::queued && queued.queue_position == 1,
+        "a 26th actively viewed dynamic symbol enters the waiting queue");
 }
 
 void test_viewer_reference_counting_and_disconnect_cleanup() {
@@ -214,8 +220,8 @@ void test_lru_grace_residency_and_protection() {
   check(!manager.eviction_candidate(), "a pending-order symbol cannot be evicted");
 
   const auto result = manager.watch("REPLACE");
-  check(result == simtrade::market::WatchResult::capacity_full,
-        "protected and viewed symbols produce CAPACITY_FULL instead of evicting a user");
+  check(result.state == simtrade::market::WatchState::queued,
+        "protected and viewed symbols queue demand instead of evicting a user");
   const auto states = manager.snapshot();
   check(std::all_of(states.begin(), states.end(), [](const auto& state) {
           return !state.pinned || !state.unsubscribe_pending;
@@ -237,7 +243,8 @@ void test_safe_lru_confirmation_sequence() {
   static_cast<void>(manager.snapshot());
   now += 1s;
 
-  check(manager.watch("NEW") == simtrade::market::WatchResult::pending, "eligible LRU starts a replacement");
+  check(manager.watch("NEW").state == simtrade::market::WatchState::connecting,
+        "eligible LRU starts a replacement");
   check(!upstream.registry.desired().contains("NEW") && upstream.registry.desired().size() == 29,
         "replacement is not subscribed before eviction confirmation");
   confirm_desired(manager, upstream);
@@ -259,11 +266,13 @@ void test_pending_order_capacity_and_concurrent_serialization() {
   check(restored != nullptr && restored->pending_order_count == 3,
         "persisted non-terminal order counts rebuild symbol protection after restart");
   for (int index = 1; index < 25; ++index) {
-    check(manager.protect_order(std::string("O") + std::to_string(index)) == simtrade::market::WatchResult::pending,
+    check(manager.protect_order(std::string("O") + std::to_string(index)).state ==
+              simtrade::market::WatchState::connecting,
           "pending orders reserve dynamic symbols");
   }
-  check(manager.protect_order("O25") == simtrade::market::WatchResult::capacity_full,
-        "the 31st protected symbol receives CAPACITY_FULL");
+  const auto protected_queue = manager.protect_order("O25");
+  check(protected_queue.state == simtrade::market::WatchState::queued && protected_queue.queue_position == 1,
+        "the 31st protected symbol is retained in the order-priority queue");
 
   FakeUpstream concurrent_upstream;
   simtrade::market::SubscriptionManager concurrent_manager(
@@ -273,7 +282,8 @@ void test_pending_order_capacity_and_concurrent_serialization() {
   for (int index = 0; index < 80; ++index) {
     threads.emplace_back([&, index] {
       const auto result = concurrent_manager.watch(std::string("C") + std::to_string(index));
-      if (result == simtrade::market::WatchResult::pending || result == simtrade::market::WatchResult::live) {
+      if (result.state == simtrade::market::WatchState::connecting ||
+          result.state == simtrade::market::WatchState::live) {
         ++accepted;
       }
     });
@@ -284,6 +294,78 @@ void test_pending_order_capacity_and_concurrent_serialization() {
         "concurrent requests never exceed 30 confirmed or pending symbols");
   check(concurrent_upstream.maximum_parallel_calls == 1,
         "all upstream subscription changes pass through one serialized command loop");
+}
+
+void test_waiting_queue_deduplication_priority_and_abandonment() {
+  FakeUpstream upstream;
+  auto now = std::chrono::steady_clock::time_point(100s);
+  simtrade::market::SubscriptionManager manager(
+      upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 30s, 30s, [&now] { return now; });
+  confirm_desired(manager, upstream);
+  for (int index = 0; index < 25; ++index) {
+    manager.protect_order(std::string("P") + std::to_string(index));
+    now += 1s;
+  }
+  confirm_desired(manager, upstream);
+
+  const auto oldest = manager.watch("WAIT1");
+  now += 1s;
+  const auto newer = manager.watch("WAIT2");
+  const auto popular = manager.watch("WAIT2");
+  check(oldest.state == simtrade::market::WatchState::queued && oldest.queue_position == 1,
+        "first capacity request receives queue position one");
+  check(newer.state == simtrade::market::WatchState::queued && popular.queue_position == 1,
+        "larger viewer demand moves one deduplicated symbol ahead");
+  check(manager.queued_symbol_count() == 2, "duplicate symbol demand shares a single queue entry");
+  const auto queue = manager.queue_snapshot();
+  check(queue.size() == 2 && queue[0].symbol == "WAIT2" && queue[0].viewer_demand == 2 &&
+            queue[1].symbol == "WAIT1",
+        "queue ordering uses viewer demand before age");
+
+  const auto order_request = manager.protect_order("ORDERQ");
+  check(order_request.state == simtrade::market::WatchState::queued && order_request.queue_position == 1,
+        "valid order demand has highest queue priority");
+  manager.release_order("ORDERQ");
+  static_cast<void>(manager.snapshot());
+  check(manager.queued_symbol_count() == 2, "empty order-only queue entries are deleted");
+
+  manager.unwatch("WAIT2");
+  manager.unwatch("WAIT2");
+  static_cast<void>(manager.snapshot());
+  check(manager.queued_symbol_count() == 1 && manager.queue_snapshot()[0].symbol == "WAIT1",
+        "abandoned viewer demand is removed before allocation");
+}
+
+void test_queue_activation_waits_for_alpaca_confirmation() {
+  FakeUpstream upstream;
+  auto now = std::chrono::steady_clock::time_point(100s);
+  simtrade::market::SubscriptionManager manager(
+      upstream, [](const std::string&) { return true; }, pinned_symbols(), 30, 0s, 0s, [&now] { return now; });
+  confirm_desired(manager, upstream);
+  for (int index = 0; index < 25; ++index) {
+    manager.watch(std::string("A") + std::to_string(index));
+    now += 1s;
+  }
+  confirm_desired(manager, upstream);
+
+  manager.watch("OLDER");
+  now += 1s;
+  manager.watch("POPULAR");
+  manager.watch("POPULAR");
+  manager.unwatch("A0");
+  static_cast<void>(manager.snapshot());
+  manager.process_queue();
+  check(!upstream.registry.desired().contains("POPULAR") && upstream.registry.desired().size() == 29,
+        "highest-priority queued symbol waits for unsubscribe confirmation");
+
+  confirm_desired(manager, upstream);
+  check(upstream.registry.desired().contains("POPULAR") && upstream.registry.desired().size() == 30,
+        "freed slot activates the highest-priority queued symbol");
+  check(!upstream.registry.desired().contains("OLDER"), "lower-priority queue entries remain queued");
+  confirm_desired(manager, upstream);
+  const auto* popular = find_state(manager.snapshot(), "POPULAR");
+  check(popular != nullptr && popular->subscribed && manager.queued_symbol_count() == 1,
+        "queued demand becomes live only after subscribe confirmation");
 }
 
 void test_authentication_normalization_and_routing() {
@@ -321,6 +403,8 @@ int main() {
   test_lru_grace_residency_and_protection();
   test_safe_lru_confirmation_sequence();
   test_pending_order_capacity_and_concurrent_serialization();
+  test_waiting_queue_deduplication_priority_and_abandonment();
+  test_queue_activation_waits_for_alpaca_confirmation();
   test_authentication_normalization_and_routing();
   if (failures == 0) {
     std::cout << "All market-data tests passed.\n";

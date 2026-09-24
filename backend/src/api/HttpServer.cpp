@@ -586,14 +586,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const bool requires_protection = order_type != "MARKET";
         if (requires_protection) {
           const auto protection = subscription_manager_.protect_order(symbol);
-          if (protection == market::WatchResult::invalid_symbol) {
+          if (protection.state == market::WatchState::invalid_symbol) {
             return json_response(http::status::bad_request,
                                  {{"error", "invalid_symbol"}, {"message", "Instrument is not in the active catalogue."}});
-          }
-          if (protection == market::WatchResult::capacity_full) {
-            return json_response(http::status::conflict,
-                                 {{"error", "CAPACITY_FULL"},
-                                  {"message", "All live market-data slots are currently in use."}});
           }
         }
         try {

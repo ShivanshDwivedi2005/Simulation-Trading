@@ -97,22 +97,27 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
         duplicate = client != clients_.end() && client->second.symbols.contains(symbol);
       }
       if (duplicate) {
-        upstream_.touch(symbol);
+        const auto result = upstream_.refresh(symbol);
+        nlohmann::json status{{"type", "market_data_status"},
+                              {"symbol", symbol},
+                              {"status", result.state == WatchState::live
+                                             ? "LIVE"
+                                             : result.state == WatchState::connecting ? "CONNECTING" : "QUEUED"},
+                              {"live", result.state == WatchState::live},
+                              {"message", result.state == WatchState::live
+                                              ? "Live market data is available."
+                                              : result.state == WatchState::connecting
+                                                    ? "Connecting to live market data."
+                                                    : "Waiting for a live market-data slot."}};
+        if (result.queue_position) status["queuePosition"] = *result.queue_position;
+        if (sender) sender(status.dump());
         accepted.push_back(symbol);
         continue;
       }
 
       const auto result = upstream_.watch(symbol);
-      if (result == WatchResult::invalid_symbol) {
+      if (result.state == WatchState::invalid_symbol) {
         send_error(sender, "invalid_symbol", "Instrument symbol is not available in the catalogue.");
-        continue;
-      }
-      if (result == WatchResult::capacity_full) {
-        if (sender) sender(nlohmann::json({{"type", "market_data_status"},
-                                          {"symbol", symbol},
-                                          {"status", "CAPACITY_FULL"},
-                                          {"live", false},
-                                          {"message", "All live market-data slots are currently in use."}}).dump());
         continue;
       }
 
@@ -130,14 +135,22 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
         continue;
       }
       accepted.push_back(symbol);
-      if (result == WatchResult::live) send_cached(sender, symbol);
-      if (sender) sender(nlohmann::json({{"type", "market_data_status"},
-                                        {"symbol", symbol},
-                                        {"status", result == WatchResult::live ? "LIVE" : "PENDING"},
-                                        {"live", result == WatchResult::live},
-                                        {"message", result == WatchResult::live
-                                                        ? "Live market data is available."
-                                                        : "Live market data subscription is pending."}}).dump());
+      send_cached(sender, symbol);
+      if (sender) {
+        nlohmann::json status{{"type", "market_data_status"},
+                              {"symbol", symbol},
+                              {"status", result.state == WatchState::live
+                                             ? "LIVE"
+                                             : result.state == WatchState::connecting ? "CONNECTING" : "QUEUED"},
+                              {"live", result.state == WatchState::live},
+                              {"message", result.state == WatchState::live
+                                              ? "Live market data is available."
+                                              : result.state == WatchState::connecting
+                                                    ? "Connecting to live market data."
+                                                    : "Waiting for a live market-data slot."}};
+        if (result.queue_position) status["queuePosition"] = *result.queue_position;
+        sender(status.dump());
+      }
     } else {
       bool removed = false;
       {
@@ -183,13 +196,16 @@ void MarketDataHub::publish(const nlohmann::json& event) {
 void MarketDataHub::publish_status(const std::string& raw_symbol,
                                    const std::string& status,
                                    bool live,
+                                   std::optional<std::size_t> queue_position,
                                    const std::string& message) {
   const auto symbol = normalize_symbol(raw_symbol);
-  publish({{"type", "market_data_status"},
-           {"symbol", symbol},
-           {"status", status},
-           {"live", live},
-           {"message", message}});
+  nlohmann::json payload{{"type", "market_data_status"},
+                         {"symbol", symbol},
+                         {"status", status},
+                         {"live", live},
+                         {"message", message}};
+  if (queue_position) payload["queuePosition"] = *queue_position;
+  publish(payload);
   if (!live) return;
 
   std::vector<Sender> recipients;

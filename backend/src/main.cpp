@@ -61,8 +61,9 @@ int main() {
         [&market_hub](const std::string& symbol,
                       const std::string& status,
                       bool live,
+                      std::optional<std::size_t> queue_position,
                       const std::string& message) {
-          market_hub.publish_status(symbol, status, live, message);
+          market_hub.publish_status(symbol, status, live, queue_position, message);
         });
     market_stream.set_subscription_handlers(
         [&subscription_manager](const std::set<std::string>& confirmed) {

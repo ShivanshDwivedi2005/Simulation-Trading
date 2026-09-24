@@ -26,6 +26,7 @@ class MarketDataHub {
   void publish_status(const std::string& symbol,
                       const std::string& status,
                       bool live,
+                      std::optional<std::size_t> queue_position,
                       const std::string& message);
   [[nodiscard]] std::size_t client_count() const;
   [[nodiscard]] std::size_t viewer_count(const std::string& symbol) const;
