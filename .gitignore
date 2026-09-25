@@ -50,3 +50,6 @@ next-env.d.ts
 /.agents/
 /outputs/
 /work/
+
+# Local product decisions; intentionally never published.
+/documentation/decisions.local.md

@@ -32,6 +32,13 @@ type MarketDataState = {
   source: string | null;
   stale: boolean;
 };
+type MarketSessionStatus = "LOADING" | "OPEN" | "PRE_OPEN" | "CLOSED" | "UNAVAILABLE";
+type MarketClockState = {
+  status: MarketSessionStatus;
+  timestamp: string | null;
+  nextOpen: string | null;
+  nextClose: string | null;
+};
 type Order = {
   id: string;
   symbol: SymbolKey;
@@ -53,7 +60,8 @@ const fallbackInstruments: Record<SymbolKey, Instrument> = {
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? "ws://localhost:8080/market";
-const MARKET_TIME_ZONE = "America/New_York";
+const DISPLAY_TIME_ZONE = "UTC";
+const EXCHANGE_TIME_ZONE = "America/New_York";
 const REGULAR_SESSION_OPEN_MINUTE = 9 * 60 + 30;
 const REGULAR_SESSION_CLOSE_MINUTE = 16 * 60;
 const REGULAR_SESSION_MINUTES = REGULAR_SESSION_CLOSE_MINUTE - REGULAR_SESSION_OPEN_MINUTE;
@@ -63,8 +71,47 @@ const marketDataStatuses = new Set<MarketDataStatus>([
   "CONNECTING", "LIVE", "QUEUED", "SNAPSHOT", "STALE", "UNAVAILABLE", "ERROR",
 ]);
 
+const exchangeSessionFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: EXCHANGE_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+const utcSessionFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: DISPLAY_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  hourCycle: "h23",
+});
+
+function dateTimeParts(formatter: Intl.DateTimeFormat, value: Date) {
+  return Object.fromEntries(
+    formatter.formatToParts(value)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+}
+
+function regularSessionOpenUtcMinute(value: Date) {
+  const exchange = dateTimeParts(exchangeSessionFormatter, value);
+  const utc = dateTimeParts(utcSessionFormatter, value);
+  const exchangeDate = Date.UTC(Number(exchange.year), Number(exchange.month) - 1, Number(exchange.day));
+  const utcDate = Date.UTC(Number(utc.year), Number(utc.month) - 1, Number(utc.day));
+  const dateDifferenceMinutes = Math.round((exchangeDate - utcDate) / 60_000);
+  const exchangeOffsetMinutes = dateDifferenceMinutes + Number(exchange.hour) * 60 + Number(exchange.minute) - (Number(utc.hour) * 60 + Number(utc.minute));
+  return REGULAR_SESSION_OPEN_MINUTE - exchangeOffsetMinutes;
+}
+
 function buildCandles(base: number, seed: number): Candle[] {
   let previous = base - 3.8;
+  const sessionOpenMinute = regularSessionOpenUtcMinute(new Date());
   return Array.from({ length: REGULAR_SESSION_MINUTES }, (_, index) => {
     const drift = Math.sin((index + seed) * 0.67) * 0.18 + Math.cos((index + seed) * 0.23) * 0.08 + 0.006;
     const open = previous;
@@ -72,7 +119,7 @@ function buildCandles(base: number, seed: number): Candle[] {
     const high = Math.max(open, close) + 0.08 + Math.abs(Math.sin(index * 1.7)) * 0.12;
     const low = Math.min(open, close) - 0.07 - Math.abs(Math.cos(index * 1.33)) * 0.11;
     previous = close;
-    const sessionMinute = REGULAR_SESSION_OPEN_MINUTE + index;
+    const sessionMinute = sessionOpenMinute + index;
     return {
       time: `${String(Math.floor(sessionMinute / 60)).padStart(2, "0")}:${String(sessionMinute % 60).padStart(2, "0")}`,
       sessionMinute,
@@ -96,31 +143,21 @@ const candleSets: Record<SymbolKey, Candle[]> = {
 const marketCandleSets = new Map<string, Candle[]>();
 const fallbackCandleSets = new Map<string, Candle[]>();
 
-const marketSessionFormatter = new Intl.DateTimeFormat("en-US", {
-  timeZone: MARKET_TIME_ZONE,
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  minute: "2-digit",
-  hourCycle: "h23",
-});
-
 function marketSessionDetails(timestamp: string) {
   const value = new Date(timestamp);
   if (Number.isNaN(value.getTime())) return null;
-  const parts = Object.fromEntries(
-    marketSessionFormatter.formatToParts(value)
-      .filter((part) => part.type !== "literal")
-      .map((part) => [part.type, part.value]),
-  );
-  const hour = Number(parts.hour);
-  const minute = Number(parts.minute);
-  if (!parts.year || !parts.month || !parts.day || ![hour, minute].every(Number.isFinite)) return null;
+  const exchange = dateTimeParts(exchangeSessionFormatter, value);
+  const utc = dateTimeParts(utcSessionFormatter, value);
+  const exchangeHour = Number(exchange.hour);
+  const exchangeMinute = Number(exchange.minute);
+  const utcHour = Number(utc.hour);
+  const utcMinute = Number(utc.minute);
+  if (!exchange.year || !exchange.month || !exchange.day || ![exchangeHour, exchangeMinute, utcHour, utcMinute].every(Number.isFinite)) return null;
   return {
-    date: `${parts.year}-${parts.month}-${parts.day}`,
-    minuteOfDay: hour * 60 + minute,
-    time: `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+    exchangeDate: `${exchange.year}-${exchange.month}-${exchange.day}`,
+    exchangeMinuteOfDay: exchangeHour * 60 + exchangeMinute,
+    utcMinuteOfDay: utcHour * 60 + utcMinute,
+    time: `${String(utcHour).padStart(2, "0")}:${String(utcMinute).padStart(2, "0")}`,
   };
 }
 
@@ -135,8 +172,8 @@ function candleFromMarketBar(raw: unknown): Candle | null {
   const volume = Number(bar.volume ?? bar.v);
   if (!timestamp || ![open, high, low, close, volume].every(Number.isFinite)) return null;
   const session = marketSessionDetails(timestamp);
-  if (!session || session.minuteOfDay < REGULAR_SESSION_OPEN_MINUTE || session.minuteOfDay >= REGULAR_SESSION_CLOSE_MINUTE) return null;
-  return { timestamp, time: session.time, sessionMinute: session.minuteOfDay, open, high, low, close, volume };
+  if (!session || session.exchangeMinuteOfDay < REGULAR_SESSION_OPEN_MINUTE || session.exchangeMinuteOfDay >= REGULAR_SESSION_CLOSE_MINUTE) return null;
+  return { timestamp, time: session.time, sessionMinute: session.utcMinuteOfDay, open, high, low, close, volume };
 }
 
 function mergeMarketCandles(symbol: string, incoming: Candle[], incomingWins: boolean) {
@@ -148,11 +185,11 @@ function mergeMarketCandles(symbol: string, incoming: Candle[], incomingWins: bo
     if (!candle.timestamp) continue;
     const session = marketSessionDetails(candle.timestamp);
     if (!session) continue;
-    if (session.date > latestSession) {
-      latestSession = session.date;
+    if (session.exchangeDate > latestSession) {
+      latestSession = session.exchangeDate;
       byTimestamp.clear();
     }
-    if (session.date === latestSession) byTimestamp.set(candle.timestamp, candle);
+    if (session.exchangeDate === latestSession) byTimestamp.set(candle.timestamp, candle);
   }
   const merged = Array.from(byTimestamp.values())
     .sort((left, right) => left.timestamp!.localeCompare(right.timestamp!))
@@ -193,9 +230,25 @@ function lastUpdateLabel(timestamp: string | null) {
     hour: "numeric",
     minute: "2-digit",
     second: "2-digit",
-    timeZone: MARKET_TIME_ZONE,
+    timeZone: DISPLAY_TIME_ZONE,
     timeZoneName: "short",
   })}`;
+}
+
+function utcTimeLabel(timestamp: string | null) {
+  if (!timestamp) return "Time unavailable";
+  const value = new Date(timestamp);
+  if (Number.isNaN(value.getTime())) return "Time unavailable";
+  return value.toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+    timeZone: DISPLAY_TIME_ZONE,
+    timeZoneName: "short",
+  });
 }
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
@@ -212,15 +265,19 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
   const max = Math.max(...values) + 0.8;
   const innerWidth = width - pad.left - pad.right;
   const innerHeight = height - pad.top - pad.bottom;
+  const sessionOpenMinute = candles[0]?.timestamp
+    ? regularSessionOpenUtcMinute(new Date(candles[0].timestamp))
+    : candles[0]?.sessionMinute ?? regularSessionOpenUtcMinute(new Date());
+  const sessionCloseMinute = sessionOpenMinute + REGULAR_SESSION_MINUTES;
   const formatSessionMinute = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
-  const xForMinute = (minute: number) => pad.left + ((minute - REGULAR_SESSION_OPEN_MINUTE) / REGULAR_SESSION_MINUTES) * innerWidth;
+  const xForMinute = (minute: number) => pad.left + ((minute - sessionOpenMinute) / REGULAR_SESSION_MINUTES) * innerWidth;
   const x = (index: number) => xForMinute(candles[index].sessionMinute);
   const y = (value: number) => pad.top + ((max - value) / (max - min)) * innerHeight;
   const points = candles.map((item, index) => `${x(index)},${y(item.close)}`).join(" ");
   const areaPoints = `${x(0)},${height - pad.bottom} ${points} ${x(candles.length - 1)},${height - pad.bottom}`;
   const gridValues = Array.from({ length: 5 }, (_, index) => min + ((max - min) * index) / 4).reverse();
   const last = candles.at(-1)!;
-  const sessionTicks = [0, 0.25, 0.5, 0.75, 1].map((position) => REGULAR_SESSION_OPEN_MINUTE + Math.round(position * REGULAR_SESSION_MINUTES));
+  const sessionTicks = [0, 0.25, 0.5, 0.75, 1].map((position) => sessionOpenMinute + Math.round(position * REGULAR_SESSION_MINUTES));
   const hasMarketData = marketCandleSets.has(symbol);
   const cursorPriceLabelWidth = 64;
   const cursorPriceLabelGap = 8;
@@ -234,9 +291,9 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
     const svgY = svgPoint.y;
     const cursorX = Math.min(width - pad.right, Math.max(pad.left, svgX));
     const cursorY = Math.min(height - pad.bottom, Math.max(pad.top, svgY));
-    const minute = Math.min(REGULAR_SESSION_CLOSE_MINUTE, Math.max(
-      REGULAR_SESSION_OPEN_MINUTE,
-      Math.round(REGULAR_SESSION_OPEN_MINUTE + ((cursorX - pad.left) / innerWidth) * REGULAR_SESSION_MINUTES),
+    const minute = Math.min(sessionCloseMinute, Math.max(
+      sessionOpenMinute,
+      Math.round(sessionOpenMinute + ((cursorX - pad.left) / innerWidth) * REGULAR_SESSION_MINUTES),
     ));
     const cursorPrice = max - ((cursorY - pad.top) / innerHeight) * (max - min);
     setCursor({ x: cursorX, y: cursorY, minute, time: formatSessionMinute(minute), price: cursorPrice, locked });
@@ -251,9 +308,9 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
     event.preventDefault();
     const currentMinute = cursor?.minute ?? candles.at(-1)!.sessionMinute;
     const nextMinute = event.key === "ArrowLeft"
-      ? Math.max(REGULAR_SESSION_OPEN_MINUTE, currentMinute - 1)
+      ? Math.max(sessionOpenMinute, currentMinute - 1)
       : event.key === "ArrowRight"
-        ? Math.min(REGULAR_SESSION_CLOSE_MINUTE, currentMinute + 1)
+        ? Math.min(sessionCloseMinute, currentMinute + 1)
         : currentMinute;
     const currentPrice = cursor?.price ?? last.close;
     const priceStep = (max - min) / 100;
@@ -268,7 +325,7 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
   return (
     <div className="chart-shell" aria-label={`${symbol} price chart. Last price ${money.format(price)}. ${paused ? "Live updates paused." : "Live updates active."}`}>
       <div className="chart-context">
-        <span>{hasMarketData ? "Market data" : "Simulated sample data"} · Regular session · Times shown in ET</span>
+        <span>{hasMarketData ? "Market data" : "Simulated sample data"} · Regular session · Times shown in UTC</span>
         <span>Move to inspect · Click to pin · Esc to clear</span>
       </div>
       <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with {candles.length} OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}. Use arrow keys to inspect time and price coordinates.</p>
@@ -328,14 +385,14 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
           <rect x={cursorPriceLabelX} y={cursor.y - 11} width={cursorPriceLabelWidth} height="22" rx="4" />
           <text x={cursorPriceLabelX + cursorPriceLabelWidth - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
           <rect x={Math.min(width - pad.right - 70, Math.max(pad.left, cursor.x - 35))} y={height - pad.bottom + 7} width="70" height="22" rx="4" />
-          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{cursor.time} ET</text>
+          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{cursor.time} UTC</text>
         </g>}
       </svg>
       <output id="chart-cursor-readout" className="sr-only" aria-live="polite">
-        {cursor ? `${cursor.time} Eastern Time, price ${money.format(cursor.price)}${cursor.locked ? ", crosshair pinned" : ""}.` : "No chart coordinate selected."}
+        {cursor ? `${cursor.time} Coordinated Universal Time, price ${money.format(cursor.price)}${cursor.locked ? ", crosshair pinned" : ""}.` : "No chart coordinate selected."}
       </output>
       <details className="chart-data-table">
-        <summary>View latest OHLC data ({hasMarketData ? "ET" : "simulated ET sample"})</summary>
+        <summary>View latest OHLC data ({hasMarketData ? "UTC" : "simulated UTC sample"})</summary>
         <div className="table-scroll">
           <table>
             <thead><tr><th>Time</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th></tr></thead>
@@ -379,6 +436,12 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     source: null,
     stale: false,
   });
+  const [marketClock, setMarketClock] = useState<MarketClockState>({
+    status: "LOADING",
+    timestamp: null,
+    nextOpen: null,
+    nextClose: null,
+  });
   const [, setChartRevision] = useState(0);
   const [instrumentQuery, setInstrumentQuery] = useState("AAPL · Apple Inc.");
   const [searchResults, setSearchResults] = useState<CatalogueInstrument[]>([]);
@@ -392,6 +455,21 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   const pausedRef = useRef(paused);
   const displayedMarketDataStatus = paused ? "Quote updates paused" : marketData.message;
   const marketDataTone = marketData.status.toLowerCase();
+  const marketSessionTone = marketClock.status.toLowerCase().replace("_", "-");
+  const marketSessionLabel = {
+    LOADING: "Checking market",
+    OPEN: "Market open",
+    PRE_OPEN: "Pre-open",
+    CLOSED: "Market closed",
+    UNAVAILABLE: "Session unavailable",
+  }[marketClock.status];
+  const marketSessionDetail = marketClock.status === "OPEN"
+    ? `Closes ${utcTimeLabel(marketClock.nextClose)}`
+    : marketClock.status === "PRE_OPEN"
+      ? `Opens ${utcTimeLabel(marketClock.nextOpen)}`
+      : marketClock.status === "CLOSED"
+        ? `Next open ${utcTimeLabel(marketClock.nextOpen)}`
+        : "US equity session time in UTC";
 
   const quote = instruments[symbol];
   const positionsValue = useMemo(
@@ -452,7 +530,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           quantity: Number(item.quantity),
           price: Number(item.price),
           status: item.status,
-          time: new Date(item.created_at).toLocaleTimeString("en-US", { hour12: false }),
+          time: utcTimeLabel(item.created_at),
         })));
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
@@ -510,6 +588,37 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     void loadQuote();
     return () => controller.abort();
   }, [symbol]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    async function loadMarketClock() {
+      try {
+        const response = await fetch(`${API_URL}/api/v1/market/clock`, { signal: controller.signal });
+        const result = await response.json() as {
+          status?: "OPEN" | "PRE_OPEN" | "CLOSED";
+          timestamp?: string;
+          nextOpen?: string;
+          nextClose?: string;
+        };
+        if (!response.ok || !result.status) throw new Error("market_clock_unavailable");
+        setMarketClock({
+          status: result.status,
+          timestamp: result.timestamp ?? null,
+          nextOpen: result.nextOpen ?? null,
+          nextClose: result.nextClose ?? null,
+        });
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setMarketClock((current) => ({ ...current, status: "UNAVAILABLE" }));
+      }
+    }
+    void loadMarketClock();
+    const intervalId = window.setInterval(() => void loadMarketClock(), 60_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(intervalId);
+    };
+  }, []);
 
   useEffect(() => {
     const query = instrumentQuery.trim();
@@ -789,7 +898,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
         quantity: Number(result.quantity ?? quantity),
         price: Number(result.price ?? estimatedPrice),
         status: result.status ?? "ACCEPTED",
-        time: result.created_at ? new Date(result.created_at).toLocaleTimeString("en-US", { hour12: false }) : new Date().toLocaleTimeString("en-US", { hour12: false }),
+        time: result.created_at ? utcTimeLabel(result.created_at) : utcTimeLabel(new Date().toISOString()),
       };
       setOrders((current) => [newOrder, ...current]);
       setActiveTable("orders");
@@ -831,35 +940,6 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           <div className="brand-mark" aria-hidden="true"><Activity /></div>
           <div><strong>SIMTRADE</strong><span>US SIMULATION</span></div>
         </div>
-        <label className="instrument-search" onBlur={(event) => {
-          if (!event.currentTarget.contains(event.relatedTarget)) setSearchOpen(false);
-        }}>
-          <Search aria-hidden="true" />
-          <span className="sr-only">Search instruments</span>
-          <input
-            ref={searchInputRef}
-            type="search"
-            role="combobox"
-            aria-label="Search all supported US equities and ETFs"
-            aria-autocomplete="list"
-            aria-controls="instrument-results"
-            aria-expanded={searchOpen}
-            value={instrumentQuery}
-            onFocus={() => setSearchOpen(true)}
-            onChange={(event) => { setInstrumentQuery(event.target.value); setSearchResults([]); setSearchLoading(true); setSearchOpen(true); }}
-            onKeyDown={(event) => { if (event.key === "Escape") setSearchOpen(false); }}
-            placeholder="Search symbol or company"
-          />
-          <span className="shortcut" aria-hidden="true">/</span>
-          {searchOpen && instrumentQuery.trim() && instrumentQuery.trim() !== `${symbol} · ${quote.name}` && <div id="instrument-results" className="instrument-results" role="listbox" aria-label="Instrument search results">
-            {searchLoading && <p role="status">Searching instruments…</p>}
-            {!searchLoading && searchResults.map((instrument) => <button key={instrument.symbol} type="button" role="option" aria-selected="false" onClick={() => selectCatalogueInstrument(instrument)}>
-              <span><strong>{instrument.symbol}</strong><small>{instrument.exchange}</small></span>
-              <span>{instrument.name}</span>
-            </button>)}
-            {!searchLoading && searchResults.length === 0 && <p>No matching instruments. Try a symbol or company name.</p>}
-          </div>}
-        </label>
         <div className="topbar-actions">
           <span className={`market-status ${marketDataTone}`} role="status" aria-atomic="true">
             <i aria-hidden="true" />
@@ -873,6 +953,34 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       <div className="workspace-grid">
         <aside className={`watchlist-panel ${mobileWatchlist ? "mobile-open" : ""}`}>
           <div className="panel-heading"><div><small>MARKET</small><h2>Watchlist</h2></div><button className="icon-button mobile-only" aria-label="Close watchlist" onClick={() => setMobileWatchlist(false)}><X aria-hidden="true" /></button></div>
+          <label className="instrument-search watchlist-search" onBlur={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) setSearchOpen(false);
+          }}>
+            <Search aria-hidden="true" />
+            <span className="sr-only">Search instruments</span>
+            <input
+              ref={searchInputRef}
+              type="search"
+              role="combobox"
+              aria-label="Search all supported US equities and ETFs"
+              aria-autocomplete="list"
+              aria-controls="instrument-results"
+              aria-expanded={searchOpen}
+              value={instrumentQuery}
+              onFocus={(event) => { setSearchOpen(true); event.currentTarget.select(); }}
+              onChange={(event) => { setInstrumentQuery(event.target.value); setSearchResults([]); setSearchLoading(true); setSearchOpen(true); }}
+              onKeyDown={(event) => { if (event.key === "Escape") setSearchOpen(false); }}
+              placeholder="Search symbol or company"
+            />
+            {searchOpen && instrumentQuery.trim() && instrumentQuery.trim() !== `${symbol} · ${quote.name}` && <div id="instrument-results" className="instrument-results" role="listbox" aria-label="Instrument search results">
+              {searchLoading && <p role="status">Searching instruments…</p>}
+              {!searchLoading && searchResults.map((instrument) => <button key={instrument.symbol} type="button" role="option" aria-selected="false" onClick={() => selectCatalogueInstrument(instrument)}>
+                <span><strong>{instrument.symbol}</strong><small>{instrument.exchange}</small></span>
+                <span>{instrument.name}</span>
+              </button>)}
+              {!searchLoading && searchResults.length === 0 && <p>No matching instruments. Try a symbol or company name.</p>}
+            </div>}
+          </label>
           <div className="watchlist-columns"><span>Symbol</span><span>Last</span><span>Change</span></div>
           <div className="watchlist-items">
             {(Object.keys(instruments) as SymbolKey[]).map((key) => {
@@ -884,13 +992,12 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               </button>;
             })}
           </div>
-          <button className="add-symbol" onClick={() => { searchInputRef.current?.focus(); setSearchOpen(true); }}><Search aria-hidden="true" /> Add symbol</button>
           <div className={`data-source ${marketDataTone}`}><ShieldCheck aria-hidden="true" /><span><strong>Alpaca market data · {marketData.status}</strong><small>{displayedMarketDataStatus}</small><small>{lastUpdateLabel(marketData.lastUpdatedAt)}</small></span></div>
         </aside>
 
         <section className="main-workspace">
           <div className="quote-strip">
-            <div className="quote-identity"><span className="instrument-avatar">{symbol.slice(0, 1)}</span><div><div><h1>{symbol}</h1><span>{quote.exchange || "US"}</span></div><p>{quote.name} · USD</p></div></div>
+            <div className="quote-identity"><span className="instrument-avatar">{symbol.slice(0, 1)}</span><div><div><h1>{symbol}</h1><span>{quote.exchange || "US"}</span><span className={`instrument-session ${marketSessionTone}`} role="status" aria-atomic="true"><i aria-hidden="true" />{marketSessionLabel}</span></div><p>{quote.name} · USD · {marketSessionDetail}</p></div></div>
             <div className="quote-price"><strong>{quote.price.toFixed(2)}</strong><span className={quote.change >= 0 ? "positive" : "negative"}>{quote.change >= 0 ? "+" : ""}{(quote.price * quote.change / 100).toFixed(2)} ({quote.change >= 0 ? "+" : ""}{quote.change.toFixed(2)}%)</span></div>
             <dl className="quote-stats"><div><dt>Bid</dt><dd>{quote.bid.toFixed(2)}</dd></div><div><dt>Ask</dt><dd>{quote.ask.toFixed(2)}</dd></div><div><dt>Spread</dt><dd>{(quote.ask - quote.bid).toFixed(2)}</dd></div><div><dt>Volume</dt><dd>42.8M</dd></div></dl>
           </div>

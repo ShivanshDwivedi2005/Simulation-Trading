@@ -454,6 +454,38 @@ void test_complete_regular_session_filtering() {
         "regular-session filtering automatically switches to EST in winter");
 }
 
+void test_market_clock_normalization() {
+  const auto pre_open = simtrade::market::normalize_market_clock({
+      {"timestamp", "2026-09-28T08:00:00-04:00"},
+      {"is_open", false},
+      {"next_open", "2026-09-28T09:30:00-04:00"},
+      {"next_close", "2026-09-28T16:00:00-04:00"},
+  });
+  check(pre_open.value("status", "") == "PRE_OPEN",
+        "04:00-09:30 Eastern is reported as pre-open");
+  check(pre_open.value("timestamp", "") == "2026-09-28T12:00:00Z" &&
+            pre_open.value("nextOpen", "") == "2026-09-28T13:30:00Z",
+        "market clock timestamps are normalized to UTC");
+
+  const auto open = simtrade::market::normalize_market_clock({
+      {"timestamp", "2026-09-28T10:00:00-04:00"},
+      {"is_open", true},
+      {"next_open", "2026-09-29T09:30:00-04:00"},
+      {"next_close", "2026-09-28T16:00:00-04:00"},
+  });
+  check(open.value("status", "") == "OPEN",
+        "Alpaca's open flag is reported as market open");
+
+  const auto closed = simtrade::market::normalize_market_clock({
+      {"timestamp", "2026-09-26T12:00:00-04:00"},
+      {"is_open", false},
+      {"next_open", "2026-09-28T09:30:00-04:00"},
+      {"next_close", "2026-09-28T16:00:00-04:00"},
+  });
+  check(closed.value("status", "") == "CLOSED",
+        "weekends and non-session periods are reported as market closed");
+}
+
 }  // namespace
 
 int main() {
@@ -468,6 +500,7 @@ int main() {
   test_queue_activation_waits_for_alpaca_confirmation();
   test_authentication_normalization_and_routing();
   test_complete_regular_session_filtering();
+  test_market_clock_normalization();
   if (failures == 0) {
     std::cout << "All market-data tests passed.\n";
     return EXIT_SUCCESS;

@@ -19,6 +19,7 @@ namespace {
 constexpr auto kMinimumRequestInterval = std::chrono::milliseconds(100);
 constexpr auto kSnapshotFreshness = std::chrono::seconds(30);
 constexpr auto kHistoricalLookback = std::chrono::hours(24 * 8);
+constexpr auto kPreMarketDuration = std::chrono::minutes(5 * 60 + 30);
 constexpr int kRegularSessionOpenMinute = 9 * 60 + 30;
 constexpr int kRegularSessionCloseMinute = 16 * 60;
 
@@ -55,7 +56,23 @@ parse_timestamp(const std::string &timestamp) {
 #endif
   if (seconds < 0)
     return std::nullopt;
-  return std::chrono::system_clock::from_time_t(seconds);
+  auto result = std::chrono::system_clock::from_time_t(seconds);
+  const auto offset_position = timestamp.find_first_of("Z+-", 19);
+  if (offset_position != std::string::npos && timestamp[offset_position] != 'Z') {
+    if (offset_position + 5 >= timestamp.size() || timestamp[offset_position + 3] != ':')
+      return std::nullopt;
+    try {
+      const auto offset_hours = std::stoi(timestamp.substr(offset_position + 1, 2));
+      const auto offset_minutes = std::stoi(timestamp.substr(offset_position + 4, 2));
+      if (offset_hours > 23 || offset_minutes > 59)
+        return std::nullopt;
+      const auto offset = std::chrono::minutes(offset_hours * 60 + offset_minutes);
+      result += timestamp[offset_position] == '+' ? -offset : offset;
+    } catch (const std::exception &) {
+      return std::nullopt;
+    }
+  }
+  return result;
 }
 
 std::tm utc_parts(std::chrono::system_clock::time_point value) {
@@ -124,10 +141,31 @@ std::string utc_date(std::chrono::system_clock::time_point value) {
   return output.str();
 }
 
+std::string utc_timestamp(std::chrono::system_clock::time_point value) {
+  const auto parts = utc_parts(value);
+  std::ostringstream output;
+  output << std::put_time(&parts, "%Y-%m-%dT%H:%M:%SZ");
+  return output.str();
+}
+
+std::string utc_time(std::chrono::system_clock::time_point value) {
+  const auto parts = utc_parts(value);
+  std::ostringstream output;
+  output << std::put_time(&parts, "%H:%M");
+  return output.str();
+}
+
 } // namespace
 
 MarketDataRestClient::MarketDataRestClient(const config::Config &config)
     : config_(config) {}
+
+nlohmann::json MarketDataRestClient::market_clock() {
+  auto base_url = config_.alpaca_trading_rest_url;
+  while (!base_url.empty() && base_url.back() == '/')
+    base_url.pop_back();
+  return normalize_market_clock(authenticated_get(base_url + "/v2/clock"));
+}
 
 nlohmann::json MarketDataRestClient::quote(const std::string &raw_symbol) {
   const auto symbol = normalize_symbol(raw_symbol);
@@ -224,16 +262,17 @@ MarketDataRestClient::historical_bars(const std::string &raw_symbol,
   response["symbol"] = symbol;
   response["source"] = "alpaca_rest_historical";
   response["live"] = false;
-  response["timeZone"] = "America/New_York";
-  response["sessionOpen"] = "09:30";
-  response["sessionClose"] = "16:00";
+  response["timeZone"] = "UTC";
   response["expectedSessionMinutes"] = 390;
   if (!response["bars"].empty()) {
-    const auto session = eastern_timestamp(
-        response["bars"].front().value("t", ""));
-    response["sessionDate"] = session ? session->date : "";
+    const auto session_open = parse_timestamp(response["bars"].front().value("t", ""));
+    response["sessionDate"] = session_open ? utc_date(*session_open) : "";
+    response["sessionOpen"] = session_open ? utc_time(*session_open) : "";
+    response["sessionClose"] = session_open ? utc_time(*session_open + std::chrono::minutes(390)) : "";
   } else {
     response["sessionDate"] = "";
+    response["sessionOpen"] = "";
+    response["sessionClose"] = "";
   }
   return response;
 }
@@ -338,6 +377,25 @@ nlohmann::json latest_regular_session_bars(const nlohmann::json &bars) {
     result.push_back(bar);
   }
   return result;
+}
+
+nlohmann::json normalize_market_clock(const nlohmann::json &clock) {
+  const auto timestamp = parse_timestamp(clock.value("timestamp", ""));
+  const auto next_open = parse_timestamp(clock.value("next_open", ""));
+  const auto next_close = parse_timestamp(clock.value("next_close", ""));
+  if (!timestamp || !next_open || !next_close)
+    throw std::runtime_error("invalid_market_clock");
+
+  const bool is_open = clock.value("is_open", false);
+  const bool is_pre_open = !is_open && *timestamp >= *next_open - kPreMarketDuration && *timestamp < *next_open;
+  return {
+      {"status", is_open ? "OPEN" : is_pre_open ? "PRE_OPEN" : "CLOSED"},
+      {"timestamp", utc_timestamp(*timestamp)},
+      {"nextOpen", utc_timestamp(*next_open)},
+      {"nextClose", utc_timestamp(*next_close)},
+      {"timeZone", "UTC"},
+      {"source", "alpaca_clock"},
+  };
 }
 
 } // namespace simtrade::market
