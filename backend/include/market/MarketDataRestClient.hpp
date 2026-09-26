@@ -18,10 +18,11 @@ public:
   explicit MarketDataRestClient(const config::Config &config);
 
   [[nodiscard]] nlohmann::json quote(const std::string &symbol);
+  [[nodiscard]] nlohmann::json market_clock();
   [[nodiscard]] std::vector<nlohmann::json>
   latest_snapshots(const std::vector<std::string> &symbols);
   [[nodiscard]] nlohmann::json historical_bars(const std::string &symbol,
-                                               std::size_t limit = 200);
+                                               std::size_t limit = 10000);
 
   [[nodiscard]] std::size_t request_count() const noexcept;
   [[nodiscard]] std::size_t rate_limit_wait_count() const noexcept;
@@ -42,5 +43,11 @@ market_data_timestamp_is_fresh(const std::string &timestamp,
                                std::chrono::seconds maximum_age,
                                std::chrono::system_clock::time_point now =
                                    std::chrono::system_clock::now());
+
+[[nodiscard]] nlohmann::json
+latest_regular_session_bars(const nlohmann::json &bars);
+
+[[nodiscard]] nlohmann::json
+normalize_market_clock(const nlohmann::json &clock);
 
 } // namespace simtrade::market

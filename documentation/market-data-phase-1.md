@@ -82,6 +82,14 @@ market:status:{symbol}
 GET /api/v1/market-data/health
 ```
 
+Market clock endpoint:
+
+```text
+GET /api/v1/market/clock
+```
+
+The endpoint uses Alpaca's authenticated market clock, returns `OPEN`, `PRE_OPEN`, or `CLOSED`, and normalizes `timestamp`, `nextOpen`, and `nextClose` to UTC. `PRE_OPEN` is the US-equity 04:00–09:30 America/New_York window; Alpaca's next-open value accounts for weekends and exchange holidays.
+
 The response reports connection state, feed, confirmed and maximum symbol counts, catalogue readiness and size, last message time, and reconnect count.
 
 ## Configuration

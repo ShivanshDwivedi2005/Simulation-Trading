@@ -49,6 +49,7 @@ PostgresRepository::PostgresRepository(const std::string& connection_string) {
   try {
     connection_ = std::make_unique<pqxx::connection>(connection_string);
     pqxx::work migration(*connection_);
+    migration.exec("SET TIME ZONE 'UTC'");
     migration.exec("ALTER TABLE orders ADD COLUMN IF NOT EXISTS execution_price_source VARCHAR(64), "
                    "ADD COLUMN IF NOT EXISTS execution_price_timestamp TIMESTAMPTZ");
     migration.exec("ALTER TABLE trades ADD COLUMN IF NOT EXISTS price_source VARCHAR(64), "

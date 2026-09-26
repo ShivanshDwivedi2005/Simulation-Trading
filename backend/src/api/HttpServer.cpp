@@ -608,6 +608,10 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         return json_response(http::status::ok, market_rest_client_.quote(symbol));
       }
 
+      if (request_.method() == http::verb::get && target == "/api/v1/market/clock") {
+        return json_response(http::status::ok, market_rest_client_.market_clock());
+      }
+
       if (request_.method() == http::verb::get && target.rfind("/api/v1/market/", 0) == 0 && target.ends_with("/bars")) {
         const auto symbol = target.substr(15, target.size() - 15 - 5);
         return json_response(http::status::ok, market_rest_client_.historical_bars(symbol));

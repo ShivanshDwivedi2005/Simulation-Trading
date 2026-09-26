@@ -5,8 +5,8 @@ Version: 0.1
 A precise, dense, dark trading workspace with immediate access to the market, chart, order ticket, and portfolio state. It should feel trustworthy and fast, not decorative or promotional.
 
 2. Desktop information architecture
-- Sticky top bar: identity, instrument search, market status, notifications, account.
-- Left rail: compact watchlist and data-source state.
+- Sticky top bar: identity, market-data status, notifications, account.
+- Left rail: instrument search, compact watchlist, and data-source state.
 - Center: quote header, chart controls, OHLC chart, accessible data table, positions/orders.
 - Right rail: portfolio summary, order ticket, and current risk policy.
 
@@ -52,4 +52,5 @@ A precise, dense, dark trading workspace with immediate access to the market, ch
 - Empty watchlist: explain how to add the first symbol.
 - Empty positions: show that no positions exist and point to the order ticket.
 - Quote failure: retain the last value, mark it stale with timestamp, offer Retry, and disable unsafe market submission.
+- Selected instruments show an accessible session badge: Market open, Pre-open, Market closed, or Session unavailable. All displayed times use UTC.
 - Rejection: state the exact rule (buying power, quantity, concentration, instrument status) and the value that must change.

@@ -409,6 +409,83 @@ void test_authentication_normalization_and_routing() {
         "live activation replaces fallback state without replaying cached data");
 }
 
+void test_complete_regular_session_filtering() {
+  nlohmann::json bars = nlohmann::json::array();
+  bars.push_back({{"t", "2026-09-24T13:29:00Z"}, {"c", 99.0}});
+  for (int minute = 0; minute < 390; ++minute) {
+    const int total_minutes = 13 * 60 + 30 + minute;
+    const int hour = total_minutes / 60;
+    const int minute_of_hour = total_minutes % 60;
+    std::ostringstream timestamp;
+    timestamp << "2026-09-24T" << std::setw(2) << std::setfill('0') << hour
+              << ':' << std::setw(2) << minute_of_hour << ":00Z";
+    bars.push_back({{"t", timestamp.str()}, {"c", 100.0 + minute}});
+  }
+  bars.push_back({{"t", "2026-09-24T20:00:00Z"}, {"c", 999.0}});
+
+  const auto full_session =
+      simtrade::market::latest_regular_session_bars(bars);
+  check(full_session.size() == 390,
+        "a complete regular session retains all 390 one-minute bars");
+  check(full_session.front().value("t", "") == "2026-09-24T13:30:00Z" &&
+            full_session.back().value("t", "") == "2026-09-24T19:59:00Z",
+        "a complete EDT session spans 09:30 through the 15:59 bar");
+
+  bars.push_back({{"t", "2026-09-25T13:29:00Z"}, {"c", 199.0}});
+  bars.push_back({{"t", "2026-09-25T13:30:00Z"}, {"c", 200.0}});
+  bars.push_back({{"t", "2026-09-25T13:31:00Z"}, {"c", 201.0}});
+
+  const auto filtered = simtrade::market::latest_regular_session_bars(bars);
+  check(filtered.size() == 2,
+        "historical bars keep only the latest regular trading session");
+  check(filtered.front().value("t", "") == "2026-09-25T13:30:00Z" &&
+            filtered.back().value("t", "") == "2026-09-25T13:31:00Z",
+        "regular-session filtering uses 09:30-16:00 Eastern during EDT");
+
+  nlohmann::json winter = nlohmann::json::array({
+      {{"t", "2026-01-05T14:29:00Z"}, {"c", 1.0}},
+      {{"t", "2026-01-05T14:30:00Z"}, {"c", 2.0}},
+      {{"t", "2026-01-05T20:59:00Z"}, {"c", 3.0}},
+      {{"t", "2026-01-05T21:00:00Z"}, {"c", 4.0}},
+  });
+  const auto winter_filtered =
+      simtrade::market::latest_regular_session_bars(winter);
+  check(winter_filtered.size() == 2,
+        "regular-session filtering automatically switches to EST in winter");
+}
+
+void test_market_clock_normalization() {
+  const auto pre_open = simtrade::market::normalize_market_clock({
+      {"timestamp", "2026-09-28T08:00:00-04:00"},
+      {"is_open", false},
+      {"next_open", "2026-09-28T09:30:00-04:00"},
+      {"next_close", "2026-09-28T16:00:00-04:00"},
+  });
+  check(pre_open.value("status", "") == "PRE_OPEN",
+        "04:00-09:30 Eastern is reported as pre-open");
+  check(pre_open.value("timestamp", "") == "2026-09-28T12:00:00Z" &&
+            pre_open.value("nextOpen", "") == "2026-09-28T13:30:00Z",
+        "market clock timestamps are normalized to UTC");
+
+  const auto open = simtrade::market::normalize_market_clock({
+      {"timestamp", "2026-09-28T10:00:00-04:00"},
+      {"is_open", true},
+      {"next_open", "2026-09-29T09:30:00-04:00"},
+      {"next_close", "2026-09-28T16:00:00-04:00"},
+  });
+  check(open.value("status", "") == "OPEN",
+        "Alpaca's open flag is reported as market open");
+
+  const auto closed = simtrade::market::normalize_market_clock({
+      {"timestamp", "2026-09-26T12:00:00-04:00"},
+      {"is_open", false},
+      {"next_open", "2026-09-28T09:30:00-04:00"},
+      {"next_close", "2026-09-28T16:00:00-04:00"},
+  });
+  check(closed.value("status", "") == "CLOSED",
+        "weekends and non-session periods are reported as market closed");
+}
+
 }  // namespace
 
 int main() {
@@ -422,6 +499,8 @@ int main() {
   test_waiting_queue_deduplication_priority_and_abandonment();
   test_queue_activation_waits_for_alpaca_confirmation();
   test_authentication_normalization_and_routing();
+  test_complete_regular_session_filtering();
+  test_market_clock_normalization();
   if (failures == 0) {
     std::cout << "All market-data tests passed.\n";
     return EXIT_SUCCESS;
