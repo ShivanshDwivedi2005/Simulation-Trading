@@ -20,6 +20,8 @@ add_executable(simtrade-api
   src/database/PostgresRepository.cpp
   src/cache/RedisClient.cpp
   src/execution/SimulationEngine.cpp
+  src/order/Order.cpp
+  src/order/OrderRepository.cpp
   src/market/MarketDataCore.cpp
   src/market/InstrumentCatalogue.cpp
   src/market/AlpacaMarketDataStream.cpp
@@ -66,4 +68,20 @@ if(BUILD_TESTING)
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion>
   )
   add_test(NAME market-data-unit-tests COMMAND simtrade-market-data-tests)
+
+  add_executable(simtrade-order-tests
+    tests/OrderTests.cpp
+    src/order/Order.cpp
+    src/order/OrderRepository.cpp
+  )
+  target_include_directories(simtrade-order-tests PRIVATE include)
+  target_link_libraries(simtrade-order-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::PQXX
+    Threads::Threads
+  )
+  target_compile_options(simtrade-order-tests PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion>
+  )
+  add_test(NAME order-phase-1-tests COMMAND simtrade-order-tests)
 endif()

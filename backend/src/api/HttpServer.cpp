@@ -578,12 +578,14 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                                                    quote["bid"].get<double>(),
                                                    quote["ask"].get<double>(),
                                                    quote.value("source", "unknown"),
-                                                   quote.value("timestamp", ""));
+                                                   quote.value("timestamp", ""),
+                                                   input.value("client_order_id", ""));
           if (!order) {
             if (requires_protection) subscription_manager_.release_order(symbol);
             return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
           }
-          if (requires_protection && (*order).value("status", "") != "ACCEPTED") {
+          if (requires_protection && ((*order).value("status", "") != "OPEN" ||
+                                      (*order).value("idempotent_replay", false))) {
             subscription_manager_.release_order(symbol);
           }
           return json_response(http::status::created, *order);
@@ -627,8 +629,12 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
       }
       if (message == "invalid_symbol") return json_response(http::status::bad_request, {{"error", message}});
       if (message == "invalid_quantity" || message == "invalid_side" || message == "invalid_order_type" ||
-          message == "limit_price_required" || message == "stop_price_required" || message == "instrument_not_found") {
+          message == "limit_price_required" || message == "stop_price_required" || message == "instrument_not_found" ||
+          message == "invalid_client_order_id" || message == "invalid_price_tick") {
         return json_response(http::status::bad_request, {{"error", message}, {"message", message}});
+      }
+      if (message == "duplicate_client_order_id") {
+        return json_response(http::status::conflict, {{"error", message}, {"message", message}});
       }
       if (message == "insufficient_buying_power" || message == "insufficient_position") {
         return json_response(http::status::unprocessable_entity, {{"error", message}, {"message", message}});
