@@ -361,10 +361,13 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
                                                               double bid,
                                                               double ask,
                                                               const std::string& price_source,
-                                                              const std::string& price_timestamp) {
+                                                              const std::string& price_timestamp,
+                                                              const std::string& requested_client_order_id) {
   std::scoped_lock lock(mutex_);
   if (!healthy()) throw std::runtime_error("database_unavailable");
-  if (!std::isfinite(quantity) || quantity <= 0.0) throw std::runtime_error("invalid_quantity");
+  if (!std::isfinite(quantity) || quantity <= 0.0 || std::trunc(quantity) != quantity) {
+    throw std::runtime_error("invalid_quantity");
+  }
   if (side != "BUY" && side != "SELL") throw std::runtime_error("invalid_side");
   if (order_type != "MARKET" && order_type != "LIMIT" && order_type != "STOP" && order_type != "STOP_LIMIT") {
     throw std::runtime_error("invalid_order_type");
@@ -378,21 +381,26 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
 
   pqxx::work transaction(*connection_);
   const auto accounts = transaction.exec_params(
-      "SELECT a.user_id::text, a.account_id::text, a.cash::double precision "
+      "SELECT a.user_id::text, u.trader_id, a.account_id::text, a.cash::double precision "
       "FROM refresh_tokens t JOIN trading_accounts a ON a.user_id = t.user_id "
+      "JOIN users u ON u.user_id = a.user_id "
       "WHERE t.token_hash = encode(digest($1, 'sha256'), 'hex') AND t.revoked_at IS NULL AND t.expires_at > now() "
       "AND a.status = 'ACTIVE' ORDER BY a.created_at LIMIT 1 FOR UPDATE OF a",
       access_token);
   if (accounts.empty()) return std::nullopt;
 
   const auto instruments = transaction.exec_params(
-      "SELECT instrument_id::text FROM instruments WHERE symbol = $1 AND status = 'ACTIVE' LIMIT 1",
+      "SELECT instrument_id::text, id, tick_size::double precision FROM instruments "
+      "WHERE symbol = $1 AND status = 'ACTIVE' LIMIT 1",
       symbol);
   if (instruments.empty()) throw std::runtime_error("instrument_not_found");
 
   const auto user_id = accounts[0]["user_id"].as<std::string>();
   const auto account_id = accounts[0]["account_id"].as<std::string>();
   const auto instrument_id = instruments[0]["instrument_id"].as<std::string>();
+  const auto trader_id = accounts[0]["trader_id"].as<long long>();
+  const auto numeric_instrument_id = instruments[0]["id"].as<long long>();
+  const auto tick_size = instruments[0]["tick_size"].as<double>();
   const bool filled = order_type == "MARKET";
   const double fill_price = side == "BUY" ? ask : bid;
   if (filled && (!std::isfinite(fill_price) || fill_price <= 0.0)) throw std::runtime_error("invalid_market_quote");
@@ -409,29 +417,75 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
     if (holdings.empty() || holdings[0][0].as<double>() < quantity) throw std::runtime_error("insufficient_position");
   }
 
-  const auto client_order_id = random_token().substr(0, 24);
+  const auto client_order_id = requested_client_order_id.empty() ? random_token().substr(0, 24) : requested_client_order_id;
+  if (client_order_id.size() > 128) throw std::runtime_error("invalid_client_order_id");
+  const auto limit_ticks = limit_price ? std::optional<long long>(std::llround(*limit_price / tick_size)) : std::nullopt;
+  const auto stop_ticks = stop_price ? std::optional<long long>(std::llround(*stop_price / tick_size)) : std::nullopt;
+  if ((limit_price && std::fabs(*limit_price / tick_size - static_cast<double>(*limit_ticks)) > 1e-7) ||
+      (stop_price && std::fabs(*stop_price / tick_size - static_cast<double>(*stop_ticks)) > 1e-7)) {
+    throw std::runtime_error("invalid_price_tick");
+  }
   const auto order = transaction.exec_params(
-      "INSERT INTO orders (user_id, account_id, instrument_id, client_order_id, side, order_type, quantity, remaining_quantity, limit_price, stop_price, status, accepted_at, filled_at, average_fill_price, execution_price_source, execution_price_timestamp) "
-      "VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, NULLIF($9, '')::numeric, NULLIF($10, '')::numeric, $11, now(), CASE WHEN $12 THEN now() ELSE NULL END, NULLIF($13, '')::numeric, CASE WHEN $12 THEN $14 ELSE NULL END, CASE WHEN $12 THEN $15::timestamptz ELSE NULL END) "
-      "RETURNING order_id::text, created_at",
+      "INSERT INTO orders (user_id, account_id, instrument_id, client_order_id, trader_id, side, order_type, quantity, remaining_quantity, limit_price, stop_price, limit_price_ticks, stop_price_ticks, status, accepted_at, filled_at, average_fill_price, execution_price_source, execution_price_timestamp) "
+      "VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, NULLIF($10, '')::numeric, NULLIF($11, '')::numeric, NULLIF($12, '')::bigint, NULLIF($13, '')::bigint, $14, now(), CASE WHEN $15 THEN now() ELSE NULL END, NULLIF($16, '')::numeric, CASE WHEN $15 THEN $17 ELSE NULL END, CASE WHEN $15 THEN $18::timestamptz ELSE NULL END) "
+      "ON CONFLICT (client_order_id) DO NOTHING RETURNING order_id::text, id, created_at",
       user_id,
       account_id,
       instrument_id,
       client_order_id,
+      trader_id,
       side,
       order_type,
       quantity,
       filled ? 0.0 : quantity,
       limit_price ? std::to_string(*limit_price) : "",
       stop_price ? std::to_string(*stop_price) : "",
-      filled ? "FILLED" : "ACCEPTED",
+      limit_ticks ? std::to_string(*limit_ticks) : "",
+      stop_ticks ? std::to_string(*stop_ticks) : "",
+      filled ? "FILLED" : "OPEN",
       filled,
       filled ? std::to_string(fill_price) : "",
       price_source,
       price_timestamp);
 
+  if (order.empty()) {
+    const auto existing = transaction.exec_params(
+        "SELECT o.order_id::text, o.status, o.created_at, i.symbol, o.side, o.order_type, "
+        "o.quantity::double precision, o.limit_price::double precision, o.stop_price::double precision "
+        "FROM orders o "
+        "JOIN instruments i ON i.instrument_id = o.instrument_id "
+        "WHERE o.client_order_id = $1 AND o.trader_id = $2",
+        client_order_id,
+        trader_id);
+    if (existing.empty()) throw std::runtime_error("duplicate_client_order_id");
+    const auto same_limit = (!limit_price && existing[0]["limit_price"].is_null()) ||
+                            (limit_price && !existing[0]["limit_price"].is_null() &&
+                             std::fabs(*limit_price - existing[0]["limit_price"].as<double>()) < 1e-7);
+    const auto same_stop = (!stop_price && existing[0]["stop_price"].is_null()) ||
+                           (stop_price && !existing[0]["stop_price"].is_null() &&
+                            std::fabs(*stop_price - existing[0]["stop_price"].as<double>()) < 1e-7);
+    if (existing[0]["symbol"].as<std::string>() != symbol || existing[0]["side"].as<std::string>() != side ||
+        existing[0]["order_type"].as<std::string>() != order_type ||
+        existing[0]["quantity"].as<double>() != quantity || !same_limit || !same_stop) {
+      throw std::runtime_error("duplicate_client_order_id");
+    }
+    transaction.commit();
+    return nlohmann::json{{"id", existing[0]["order_id"].as<std::string>()},
+                          {"client_order_id", client_order_id},
+                          {"symbol", existing[0]["symbol"].as<std::string>()},
+                          {"side", side},
+                          {"type", order_type},
+                          {"quantity", quantity},
+                          {"price", limit_price.value_or(stop_price.value_or(0.0))},
+                          {"status", existing[0]["status"].as<std::string>()},
+                          {"idempotent_replay", true},
+                          {"created_at", existing[0]["created_at"].as<std::string>()}};
+  }
+
   if (filled) {
     const auto order_id = order[0]["order_id"].as<std::string>();
+    const auto numeric_order_id = order[0]["id"].as<long long>();
+    const auto execution_id = random_token();
     transaction.exec_params(
         "INSERT INTO trades (order_id, user_id, account_id, instrument_id, side, quantity, price, price_source, price_timestamp) VALUES ($1::uuid, $2::uuid, $3::uuid, $4::uuid, $5, $6, $7, $8, $9::timestamptz)",
         order_id,
@@ -443,6 +497,25 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
         fill_price,
         price_source,
         price_timestamp);
+    transaction.exec_params(
+        "INSERT INTO executions (execution_id, order_id, trader_id, instrument_id, execution_price_ticks, execution_quantity, market_bid_ticks, market_ask_ticks, price_source, market_timestamp) "
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::timestamptz)",
+        execution_id,
+        numeric_order_id,
+        trader_id,
+        numeric_instrument_id,
+        std::llround(fill_price / tick_size),
+        static_cast<long long>(quantity),
+        std::llround(bid / tick_size),
+        std::llround(ask / tick_size),
+        price_source,
+        price_timestamp);
+    transaction.exec_params(
+        "INSERT INTO order_events (event_id, order_id, event_type, event_data) "
+        "VALUES ($1, $2, 'EXECUTION_RECORDED', jsonb_build_object('execution_id', $3::text))",
+        "execution:" + execution_id,
+        numeric_order_id,
+        execution_id);
     if (side == "BUY") {
       transaction.exec_params("UPDATE trading_accounts SET cash = cash - $2, version = version + 1, updated_at = now() WHERE account_id = $1::uuid", account_id, notional);
       transaction.exec_params(
@@ -471,12 +544,14 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
   transaction.commit();
   return nlohmann::json{
       {"id", order[0]["order_id"].as<std::string>()},
+      {"client_order_id", client_order_id},
       {"symbol", symbol},
       {"side", side},
       {"type", order_type},
       {"quantity", quantity},
       {"price", filled ? fill_price : limit_price.value_or(stop_price.value_or(0.0))},
-      {"status", filled ? "FILLED" : "ACCEPTED"},
+      {"status", filled ? "FILLED" : "OPEN"},
+      {"idempotent_replay", false},
       {"price_source", filled ? nlohmann::json(price_source) : nlohmann::json(nullptr)},
       {"price_timestamp", filled ? nlohmann::json(price_timestamp) : nlohmann::json(nullptr)},
       {"created_at", order[0]["created_at"].as<std::string>()},
@@ -498,11 +573,16 @@ std::optional<nlohmann::json> PostgresRepository::cancel_order(const std::string
   const auto rows = transaction.exec_params(
       "UPDATE orders o SET status = 'CANCELLED', cancelled_at = now(), updated_at = now(), version = version + 1 "
       "FROM instruments i WHERE o.instrument_id = i.instrument_id AND o.order_id = $1::uuid "
-      "AND o.user_id = $2::uuid AND o.status IN ('NEW', 'ACCEPTED', 'PARTIALLY_FILLED') "
-      "RETURNING o.order_id::text, i.symbol, o.status",
+      "AND o.user_id = $2::uuid AND o.status IN ('PENDING', 'OPEN', 'PARTIALLY_FILLED') "
+      "RETURNING o.order_id::text, o.id, i.symbol, o.status",
       order_id,
       users[0][0].as<std::string>());
   if (rows.empty()) throw std::runtime_error("order_not_cancellable");
+  transaction.exec_params(
+      "INSERT INTO order_events (event_id, order_id, event_type, event_data) "
+      "VALUES ($1, $2, 'ORDER_CANCELLED', '{}'::jsonb)",
+      random_token(),
+      rows[0]["id"].as<long long>());
   transaction.commit();
   return nlohmann::json{{"id", rows[0]["order_id"].as<std::string>()},
                         {"symbol", rows[0]["symbol"].as<std::string>()},
@@ -516,7 +596,7 @@ std::map<std::string, std::size_t> PostgresRepository::pending_order_symbol_coun
   const auto rows = transaction.exec(
       "SELECT i.symbol, count(*)::bigint AS pending_count FROM orders o "
       "JOIN instruments i ON i.instrument_id = o.instrument_id "
-      "WHERE o.status IN ('NEW', 'ACCEPTED', 'PARTIALLY_FILLED') GROUP BY i.symbol ORDER BY i.symbol");
+      "WHERE o.status IN ('PENDING', 'OPEN', 'PARTIALLY_FILLED') GROUP BY i.symbol ORDER BY i.symbol");
   std::map<std::string, std::size_t> counts;
   for (const auto& row : rows) {
     counts.emplace(row["symbol"].as<std::string>(), row["pending_count"].as<std::size_t>());
