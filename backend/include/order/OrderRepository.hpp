@@ -12,6 +12,8 @@
 
 namespace simtrade::order {
 
+struct StreamEvent;
+
 struct NewOrder {
   std::string clientOrderId;
   TraderId traderId{};
@@ -57,6 +59,7 @@ class OrderRepository {
   [[nodiscard]] bool record_execution(const Execution& execution, std::uint32_t expected_order_version);
   [[nodiscard]] bool record_order_event(const std::string& event_id, OrderId order_id,
                                         const std::string& event_type, const nlohmann::json& event_data);
+  [[nodiscard]] bool persist_stream_events(const std::vector<StreamEvent>& events);
   [[nodiscard]] std::vector<Order> load_active_orders() const;
   [[nodiscard]] std::vector<Order> load_active_orders_for_instrument(InstrumentId instrument_id) const;
   [[nodiscard]] std::vector<Order> load_trader_order_history(TraderId trader_id, std::size_t limit = 100) const;
