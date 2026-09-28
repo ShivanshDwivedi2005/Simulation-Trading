@@ -28,6 +28,9 @@ struct Config {
   std::uint32_t market_data_min_residency_seconds;
   std::uint32_t order_maximum_price_age_ms;
   std::uint32_t order_matching_batch_size;
+  std::uint32_t order_queue_capacity;
+  std::uint32_t order_enqueue_timeout_ms;
+  std::uint32_t order_persistence_batch_size;
   std::string smtp_host;
   std::uint16_t smtp_port;
   std::string smtp_username;

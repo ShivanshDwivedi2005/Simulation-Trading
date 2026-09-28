@@ -16,7 +16,7 @@ MarketDataHub::MarketDataHub(ViewerSubscriptionSink& upstream,
 MarketDataHub::ClientId MarketDataHub::add_client(Sender sender) {
   std::scoped_lock lock(mutex_);
   const auto id = next_client_id_++;
-  clients_.emplace(id, Client{std::move(sender), {}});
+  clients_.emplace(id, Client{std::move(sender), {}, std::nullopt});
   return id;
 }
 
@@ -56,6 +56,21 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
   }
 
   const auto action = input.value("action", "");
+  if (action == "authenticate") {
+    const auto token = input.value("accessToken", "");
+    const auto trader_id = authenticator_ ? authenticator_(token) : std::nullopt;
+    Sender sender;
+    {
+      std::scoped_lock lock(mutex_);
+      const auto client = clients_.find(client_id);
+      if (client == clients_.end()) return;
+      sender = client->second.sender;
+      client->second.trader_id = trader_id;
+    }
+    if (sender) sender(nlohmann::json({{"type", "authentication"},
+                                       {"authenticated", trader_id.has_value()}}).dump());
+    return;
+  }
   const bool watching = action == "watch" || action == "subscribe";
   const bool unwatching = action == "unwatch" || action == "unsubscribe";
   std::vector<nlohmann::json> raw_symbols;
@@ -183,6 +198,25 @@ void MarketDataHub::handle_client_message(ClientId client_id, const std::string&
   }
 
   if (sender) sender(nlohmann::json({{"type", "clientSubscription"}, {"action", action}, {"symbols", accepted}}).dump());
+}
+
+std::size_t MarketDataHub::publish_order_event(std::uint64_t trader_id, const nlohmann::json& event) {
+  std::vector<Sender> recipients;
+  {
+    std::scoped_lock lock(mutex_);
+    for (const auto& [id, client] : clients_) {
+      static_cast<void>(id);
+      if (client.trader_id && *client.trader_id == trader_id) recipients.push_back(client.sender);
+    }
+  }
+  const auto payload = event.dump();
+  for (const auto& sender : recipients) sender(payload);
+  return recipients.size();
+}
+
+void MarketDataHub::set_authenticator(Authenticator authenticator) {
+  std::scoped_lock lock(mutex_);
+  authenticator_ = std::move(authenticator);
 }
 
 void MarketDataHub::publish(const nlohmann::json& event) {

@@ -55,7 +55,10 @@ class PostgresRepository {
                                                           const std::string& client_order_id = "");
   [[nodiscard]] std::optional<nlohmann::json> cancel_order(const std::string& access_token,
                                                            const std::string& order_id);
+  [[nodiscard]] std::optional<nlohmann::json> authorize_order_cancel(const std::string& access_token,
+                                                                     const std::string& order_id) const;
   [[nodiscard]] std::map<std::string, std::size_t> pending_order_symbol_counts() const;
+  [[nodiscard]] std::optional<std::uint64_t> trader_id_for_token(const std::string& access_token) const;
 
  private:
   std::unique_ptr<pqxx::connection> connection_;

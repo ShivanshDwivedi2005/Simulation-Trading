@@ -126,9 +126,9 @@ class AlpacaWebSocketSession final : public std::enable_shared_from_this<AlpacaW
       return;
     }
     websocket_.next_layer().set_verify_callback(ssl::rfc2818_verification(url_.host));
-    resolver_.async_resolve(url_.host,
-                            url_.port,
-                            beast::bind_front_handler(&AlpacaWebSocketSession::on_resolve, shared_from_this()));
+    beast::error_code error;
+    const auto results = resolver_.resolve(url_.host, url_.port, error);
+    on_resolve(error, results);
   }
 
   [[nodiscard]] const std::string& error() const noexcept { return error_; }

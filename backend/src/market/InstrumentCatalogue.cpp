@@ -60,7 +60,7 @@ InstrumentCatalogue::InstrumentCatalogue(const config::Config& config, const cac
 
 InstrumentCatalogue::~InstrumentCatalogue() { stop(); }
 
-void InstrumentCatalogue::start() {
+void InstrumentCatalogue::start(bool background_refresh) {
   if (running_.exchange(true)) return;
   try {
     if (!load_cached_catalogue()) synchronize();
@@ -68,7 +68,7 @@ void InstrumentCatalogue::start() {
     running_ = false;
     throw;
   }
-  worker_ = std::thread([this] { run(); });
+  if (background_refresh) worker_ = std::thread([this] { run(); });
 }
 
 void InstrumentCatalogue::stop() {

@@ -20,6 +20,7 @@ class MarketDataHub {
   using Sender = std::function<void(const std::string&)>;
   using CacheReader = std::function<std::optional<std::string>(const std::string&)>;
   using FallbackFetcher = std::function<std::vector<nlohmann::json>(const std::string&)>;
+  using Authenticator = std::function<std::optional<std::uint64_t>(const std::string&)>;
 
   MarketDataHub(ViewerSubscriptionSink& upstream,
                 CacheReader cache_reader,
@@ -28,6 +29,8 @@ class MarketDataHub {
   void remove_client(ClientId client_id);
   void handle_client_message(ClientId client_id, const std::string& message);
   void publish(const nlohmann::json& event);
+  [[nodiscard]] std::size_t publish_order_event(std::uint64_t trader_id, const nlohmann::json& event);
+  void set_authenticator(Authenticator authenticator);
   void publish_status(const std::string& symbol,
                       const std::string& status,
                       bool live,
@@ -43,6 +46,7 @@ class MarketDataHub {
   struct Client {
     Sender sender;
     std::set<std::string> symbols;
+    std::optional<std::uint64_t> trader_id;
   };
 
   void send_fallback(const Sender& sender, const std::string& symbol) const;
@@ -52,6 +56,7 @@ class MarketDataHub {
   ViewerSubscriptionSink& upstream_;
   CacheReader cache_reader_;
   FallbackFetcher fallback_fetcher_;
+  Authenticator authenticator_;
   mutable std::mutex mutex_;
   ClientId next_client_id_{1};
   std::map<ClientId, Client> clients_;

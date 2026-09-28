@@ -78,7 +78,8 @@ public:
                       std::vector<std::string> pinned_symbols,
                       std::size_t capacity, std::chrono::seconds eviction_grace,
                       std::chrono::seconds minimum_residency,
-                      Clock clock = std::chrono::steady_clock::now);
+                      Clock clock = std::chrono::steady_clock::now,
+                      bool dedicated_thread = true);
   ~SubscriptionManager();
 
   SubscriptionManager(const SubscriptionManager &) = delete;
@@ -183,9 +184,11 @@ private:
   const Clock clock_;
 
   mutable std::mutex queue_mutex_;
+  mutable std::recursive_mutex inline_mutex_;
   mutable std::condition_variable queue_condition_;
   mutable std::deque<Task> tasks_;
   bool stopping_ = false;
+  bool dedicated_thread_ = true;
   std::thread worker_;
 
   std::map<std::string, SymbolSubscription> states_;
