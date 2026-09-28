@@ -136,6 +136,16 @@ void test_repository(const std::string& connection_string, const Fixture& fixtur
 
   check(repository.record_order_event(unique_value("event-"), execution_order.id, "TEST_EVENT", {{"ok", true}}),
         "order events are persisted");
+  const auto stop_order = repository.insert_order(
+      {unique_value("stop-order-"), fixture.trader_id, fixture.instrument_id, Side::Buy,
+       OrderType::Stop, OrderStatus::Open, std::nullopt, 15200, 2});
+  check(repository.activate_stop(stop_order.id, stop_order.traderId, stop_order.version),
+        "stop activation is persisted with optimistic version checking");
+  const auto activated_stop = repository.find_order(stop_order.id).value();
+  check(activated_stop.stopActivated && activated_stop.version == stop_order.version + 1,
+        "persisted stop activation survives repository reloads");
+  check(!repository.activate_stop(stop_order.id, stop_order.traderId, stop_order.version),
+        "a stop cannot be activated twice with a stale version");
   const auto history = repository.load_trader_order_history(fixture.trader_id);
   check(history.size() >= 2 && history.front().createdAt >= history.back().createdAt,
         "trader history is returned newest first");

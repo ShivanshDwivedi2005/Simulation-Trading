@@ -94,6 +94,8 @@ Config Config::from_environment() {
       .alpaca_pinned_symbols = pinned_symbols(),
       .market_data_eviction_grace_seconds = env_positive_integer("MARKET_DATA_EVICTION_GRACE_SECONDS", 30),
       .market_data_min_residency_seconds = env_positive_integer("MARKET_DATA_MIN_RESIDENCY_SECONDS", 30),
+      .order_maximum_price_age_ms = env_positive_integer("ORDER_MAXIMUM_PRICE_AGE_MS", 30000),
+      .order_matching_batch_size = env_positive_integer("ORDER_MATCHING_BATCH_SIZE", 100),
       .smtp_host = env_or("SMTP_HOST", ""),
       .smtp_port = env_port("SMTP_PORT", 587),
       .smtp_username = env_or("SMTP_USERNAME", ""),
@@ -106,6 +108,9 @@ Config Config::from_environment() {
   };
   if (config.alpaca_max_stream_symbols != 30) {
     throw std::runtime_error("ALPACA_MAX_STREAM_SYMBOLS must be 30 for the Phase 2 five-pinned/25-dynamic allocation");
+  }
+  if (config.order_matching_batch_size > 1000) {
+    throw std::runtime_error("ORDER_MATCHING_BATCH_SIZE must not exceed 1000");
   }
   return config;
 }

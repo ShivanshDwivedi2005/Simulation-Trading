@@ -35,6 +35,7 @@ struct Order {
   std::optional<std::string> rejectionReason;
   std::chrono::system_clock::time_point createdAt;
   std::chrono::system_clock::time_point updatedAt;
+  bool stopActivated{};
 };
 
 struct Instrument {

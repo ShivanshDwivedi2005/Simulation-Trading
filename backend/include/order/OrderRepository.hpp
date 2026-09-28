@@ -53,6 +53,7 @@ class OrderRepository {
   [[nodiscard]] bool update_remaining_quantity(OrderId id, TraderId trader_id, Quantity remaining_quantity,
                                                std::uint32_t expected_version);
   [[nodiscard]] bool cancel_order(OrderId id, TraderId trader_id, std::uint32_t expected_version);
+  [[nodiscard]] bool activate_stop(OrderId id, TraderId trader_id, std::uint32_t expected_version);
   [[nodiscard]] bool record_execution(const Execution& execution, std::uint32_t expected_order_version);
   [[nodiscard]] bool record_order_event(const std::string& event_id, OrderId order_id,
                                         const std::string& event_type, const nlohmann::json& event_data);

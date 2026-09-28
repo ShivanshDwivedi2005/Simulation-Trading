@@ -22,6 +22,8 @@ add_executable(simtrade-api
   src/execution/SimulationEngine.cpp
   src/order/Order.cpp
   src/order/OrderRepository.cpp
+  src/order/RedisOrderStore.cpp
+  src/order/MatchingEngine.cpp
   src/market/MarketDataCore.cpp
   src/market/InstrumentCatalogue.cpp
   src/market/AlpacaMarketDataStream.cpp
@@ -84,4 +86,21 @@ if(BUILD_TESTING)
     $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion>
   )
   add_test(NAME order-phase-1-tests COMMAND simtrade-order-tests)
+
+  add_executable(simtrade-order-matching-tests
+    tests/OrderMatchingTests.cpp
+    src/order/Order.cpp
+    src/order/RedisOrderStore.cpp
+    src/order/MatchingEngine.cpp
+  )
+  target_include_directories(simtrade-order-matching-tests PRIVATE include)
+  target_link_libraries(simtrade-order-matching-tests PRIVATE
+    nlohmann_json::nlohmann_json
+    PkgConfig::HIREDIS
+    Threads::Threads
+  )
+  target_compile_options(simtrade-order-matching-tests PRIVATE
+    $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall -Wextra -Wpedantic -Wconversion>
+  )
+  add_test(NAME order-phase-2-tests COMMAND simtrade-order-matching-tests)
 endif()

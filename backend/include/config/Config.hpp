@@ -26,6 +26,8 @@ struct Config {
   std::vector<std::string> alpaca_pinned_symbols;
   std::uint32_t market_data_eviction_grace_seconds;
   std::uint32_t market_data_min_residency_seconds;
+  std::uint32_t order_maximum_price_age_ms;
+  std::uint32_t order_matching_batch_size;
   std::string smtp_host;
   std::uint16_t smtp_port;
   std::string smtp_username;

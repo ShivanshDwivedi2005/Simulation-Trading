@@ -13,7 +13,7 @@ constexpr auto order_columns =
     "limit_price_ticks, stop_price_ticks, quantity::bigint AS quantity, "
     "remaining_quantity::bigint AS remaining_quantity, sequence_number, version, rejection_reason, "
     "floor(extract(epoch FROM created_at) * 1000)::bigint AS created_at_ms, "
-    "floor(extract(epoch FROM updated_at) * 1000)::bigint AS updated_at_ms";
+    "floor(extract(epoch FROM updated_at) * 1000)::bigint AS updated_at_ms, stop_activated";
 
 std::string select_order_sql(std::string_view where_clause, std::string_view suffix = {}) {
   return std::string("SELECT ") + order_columns +
@@ -52,6 +52,7 @@ simtrade::order::Order map_order(const pqxx::row& row) {
   if (!row["rejection_reason"].is_null()) order.rejectionReason = row["rejection_reason"].as<std::string>();
   order.createdAt = std::chrono::system_clock::time_point(std::chrono::milliseconds(row["created_at_ms"].as<std::int64_t>()));
   order.updatedAt = std::chrono::system_clock::time_point(std::chrono::milliseconds(row["updated_at_ms"].as<std::int64_t>()));
+  order.stopActivated = row["stop_activated"].as<bool>();
   validate(order);
   return order;
 }
@@ -105,6 +106,12 @@ void OrderRepository::prepare_statements() {
       "order_cancel",
       "UPDATE orders SET status = 'CANCELLED', cancelled_at = now(), version = version + 1, updated_at = now() "
       "WHERE id = $1 AND trader_id = $2 AND version = $3 "
+      "AND status IN ('PENDING', 'OPEN', 'PARTIALLY_FILLED') RETURNING id");
+  connection_->prepare(
+      "order_stop_activate",
+      "UPDATE orders SET stop_activated = true, version = version + 1, updated_at = now() "
+      "WHERE id = $1 AND trader_id = $2 AND version = $3 AND stop_activated = false "
+      "AND order_type IN ('STOP', 'STOP_LIMIT') "
       "AND status IN ('PENDING', 'OPEN', 'PARTIALLY_FILLED') RETURNING id");
   connection_->prepare(
       "execution_insert",
@@ -205,6 +212,14 @@ bool OrderRepository::cancel_order(OrderId id, TraderId trader_id, std::uint32_t
   std::scoped_lock lock(mutex_);
   pqxx::work transaction(*connection_);
   const auto rows = transaction.exec_prepared("order_cancel", id, trader_id, expected_version);
+  transaction.commit();
+  return !rows.empty();
+}
+
+bool OrderRepository::activate_stop(OrderId id, TraderId trader_id, std::uint32_t expected_version) {
+  std::scoped_lock lock(mutex_);
+  pqxx::work transaction(*connection_);
+  const auto rows = transaction.exec_prepared("order_stop_activate", id, trader_id, expected_version);
   transaction.commit();
   return !rows.empty();
 }

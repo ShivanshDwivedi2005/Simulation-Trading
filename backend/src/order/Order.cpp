@@ -155,6 +155,9 @@ void validate(const Order& order) {
   if ((order.type == OrderType::Stop || order.type == OrderType::StopLimit) && (!order.stopPrice || *order.stopPrice <= 0)) {
     throw std::invalid_argument("stop price is required");
   }
+  if (order.stopActivated && order.type != OrderType::Stop && order.type != OrderType::StopLimit) {
+    throw std::invalid_argument("only stop orders can be activated");
+  }
 }
 
 }  // namespace simtrade::order
