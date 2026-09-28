@@ -29,7 +29,7 @@ class MatchingEngine {
 
   MatchingEngine(RedisOrderStore& store, std::vector<Instrument> instruments,
                  std::size_t batch_size, ExecutionHandler execution_handler = {},
-                 ActivationHandler activation_handler = {});
+                 ActivationHandler activation_handler = {}, std::string identifier_namespace = {});
   [[nodiscard]] MatchingResult process(const nlohmann::json& event);
   [[nodiscard]] RecoveryResult recover(const std::vector<Order>& active_orders);
 
@@ -53,6 +53,7 @@ class MatchingEngine {
   std::size_t batch_size_;
   ExecutionHandler execution_handler_;
   ActivationHandler activation_handler_;
+  std::string identifier_namespace_;
   std::atomic<std::uint64_t> identifier_sequence_{1};
 };
 
