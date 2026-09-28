@@ -450,7 +450,8 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
 
   if (order.empty()) {
     const auto existing = transaction.exec_params(
-        "SELECT o.order_id::text, o.status, o.created_at, i.symbol, o.side, o.order_type, "
+        "SELECT o.order_id::text, o.id, o.trader_id, i.id AS instrument_numeric_id, o.version, o.sequence_number, "
+        "o.status, o.created_at, i.symbol, o.side, o.order_type, "
         "o.quantity::double precision, o.limit_price::double precision, o.stop_price::double precision "
         "FROM orders o "
         "JOIN instruments i ON i.instrument_id = o.instrument_id "
@@ -471,6 +472,11 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
     }
     transaction.commit();
     return nlohmann::json{{"id", existing[0]["order_id"].as<std::string>()},
+                          {"numeric_order_id", existing[0]["id"].as<long long>()},
+                          {"trader_id", existing[0]["trader_id"].as<long long>()},
+                          {"instrument_id", existing[0]["instrument_numeric_id"].as<long long>()},
+                          {"version", existing[0]["version"].as<int>()},
+                          {"sequence_number", existing[0]["sequence_number"].as<long long>()},
                           {"client_order_id", client_order_id},
                           {"symbol", existing[0]["symbol"].as<std::string>()},
                           {"side", side},
@@ -544,6 +550,10 @@ std::optional<nlohmann::json> PostgresRepository::place_order(const std::string&
   transaction.commit();
   return nlohmann::json{
       {"id", order[0]["order_id"].as<std::string>()},
+      {"numeric_order_id", order[0]["id"].as<long long>()},
+      {"trader_id", trader_id},
+      {"instrument_id", numeric_instrument_id},
+      {"version", 1},
       {"client_order_id", client_order_id},
       {"symbol", symbol},
       {"side", side},
@@ -574,7 +584,7 @@ std::optional<nlohmann::json> PostgresRepository::cancel_order(const std::string
       "UPDATE orders o SET status = 'CANCELLED', cancelled_at = now(), updated_at = now(), version = version + 1 "
       "FROM instruments i WHERE o.instrument_id = i.instrument_id AND o.order_id = $1::uuid "
       "AND o.user_id = $2::uuid AND o.status IN ('PENDING', 'OPEN', 'PARTIALLY_FILLED') "
-      "RETURNING o.order_id::text, o.id, i.symbol, o.status",
+      "RETURNING o.order_id::text, o.id, o.trader_id, o.version - 1 AS previous_version, i.symbol, o.status",
       order_id,
       users[0][0].as<std::string>());
   if (rows.empty()) throw std::runtime_error("order_not_cancellable");
@@ -585,6 +595,9 @@ std::optional<nlohmann::json> PostgresRepository::cancel_order(const std::string
       rows[0]["id"].as<long long>());
   transaction.commit();
   return nlohmann::json{{"id", rows[0]["order_id"].as<std::string>()},
+                        {"numeric_order_id", rows[0]["id"].as<long long>()},
+                        {"trader_id", rows[0]["trader_id"].as<long long>()},
+                        {"previous_version", rows[0]["previous_version"].as<int>()},
                         {"symbol", rows[0]["symbol"].as<std::string>()},
                         {"status", rows[0]["status"].as<std::string>()}};
 }

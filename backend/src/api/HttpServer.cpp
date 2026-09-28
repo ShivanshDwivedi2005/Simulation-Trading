@@ -300,10 +300,13 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
               market::AlpacaMarketDataStream& market_stream,
               market::MarketDataHub& market_hub,
               market::SubscriptionManager& subscription_manager,
-              market::MarketDataRestClient& market_rest_client)
+              market::MarketDataRestClient& market_rest_client,
+              order::OrderRepository* order_repository,
+              order::RedisOrderStore& order_store)
       : stream_(std::move(socket)), config_(config), postgres_(postgres), redis_(redis),
         catalogue_(catalogue), market_stream_(market_stream), market_hub_(market_hub),
-        subscription_manager_(subscription_manager), market_rest_client_(market_rest_client) {}
+        subscription_manager_(subscription_manager), market_rest_client_(market_rest_client),
+        order_repository_(order_repository), order_store_(order_store) {}
 
   void run() { read(); }
 
@@ -584,6 +587,14 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
             if (requires_protection) subscription_manager_.release_order(symbol);
             return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
           }
+          if ((*order).value("status", "") == "OPEN") {
+            if (order_repository_ == nullptr) throw std::runtime_error("order_repository_unavailable");
+            const auto persisted = order_repository_->find_order(
+                static_cast<simtrade::order::OrderId>((*order).at("numeric_order_id").get<std::uint64_t>()));
+            if (!persisted || !order_store_.add_order(*persisted)) {
+              throw std::runtime_error("active_order_index_failed");
+            }
+          }
           if (requires_protection && ((*order).value("status", "") != "OPEN" ||
                                       (*order).value("idempotent_replay", false))) {
             subscription_manager_.release_order(symbol);
@@ -601,6 +612,11 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const auto order_id = target.substr(std::string("/api/v1/orders/").size());
         const auto order = postgres_.cancel_order(token, order_id);
         if (!order) return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
+        static_cast<void>(order_store_.cancel_order(
+            static_cast<simtrade::order::OrderId>((*order).at("numeric_order_id").get<std::uint64_t>()),
+            static_cast<simtrade::order::TraderId>((*order).at("trader_id").get<std::uint64_t>()),
+            (*order).at("previous_version").get<std::uint32_t>(),
+            "cancel:" + (*order).at("numeric_order_id").dump()));
         subscription_manager_.release_order((*order)["symbol"].get<std::string>());
         return json_response(http::status::ok, *order);
       }
@@ -673,6 +689,8 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   market::MarketDataHub& market_hub_;
   market::SubscriptionManager& subscription_manager_;
   market::MarketDataRestClient& market_rest_client_;
+  order::OrderRepository* order_repository_;
+  order::RedisOrderStore& order_store_;
 };
 
 HttpServer::HttpServer(net::io_context& io,
@@ -683,10 +701,12 @@ HttpServer::HttpServer(net::io_context& io,
                        market::AlpacaMarketDataStream& market_stream,
                        market::MarketDataHub& market_hub,
                        market::SubscriptionManager& subscription_manager,
-                       market::MarketDataRestClient& market_rest_client)
+                       market::MarketDataRestClient& market_rest_client,
+                       order::OrderRepository* order_repository,
+                       order::RedisOrderStore& order_store)
     : io_(io), config_(config), postgres_(postgres), redis_(redis), catalogue_(catalogue),
       market_stream_(market_stream), market_hub_(market_hub), subscription_manager_(subscription_manager),
-      market_rest_client_(market_rest_client),
+      market_rest_client_(market_rest_client), order_repository_(order_repository), order_store_(order_store),
       acceptor_(net::make_strand(io)) {
   const auto address = net::ip::make_address(config.http_host);
   const tcp::endpoint endpoint{address, config.http_port};
@@ -707,7 +727,8 @@ void HttpServer::accept() {
   acceptor_.async_accept(net::make_strand(io_), [this](beast::error_code error, tcp::socket socket) {
     if (!error) {
       std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_, catalogue_, market_stream_,
-                                    market_hub_, subscription_manager_, market_rest_client_)->run();
+                                    market_hub_, subscription_manager_, market_rest_client_, order_repository_,
+                                    order_store_)->run();
     }
     if (acceptor_.is_open()) accept();
   });

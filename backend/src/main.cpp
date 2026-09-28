@@ -7,6 +7,9 @@
 #include "market/MarketDataHub.hpp"
 #include "market/MarketDataRestClient.hpp"
 #include "market/SubscriptionManager.hpp"
+#include "order/MatchingEngine.hpp"
+#include "order/OrderRepository.hpp"
+#include "order/RedisOrderStore.hpp"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/signal_set.hpp>
@@ -16,6 +19,7 @@
 #include <iostream>
 #include <chrono>
 #include <csignal>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -38,6 +42,38 @@ int main() {
     const auto config = simtrade::config::Config::from_environment();
     simtrade::database::PostgresRepository postgres(config.database_url);
     simtrade::cache::RedisClient redis(config.redis_url);
+    simtrade::order::RedisOrderStore order_store(config.redis_url, config.order_maximum_price_age_ms);
+    std::unique_ptr<simtrade::order::OrderRepository> order_repository;
+    std::vector<simtrade::order::Instrument> order_instruments;
+    if (postgres.healthy()) {
+      order_repository = std::make_unique<simtrade::order::OrderRepository>(config.database_url);
+      order_instruments = order_repository->load_active_instruments();
+    }
+    simtrade::order::MatchingEngine matching_engine(
+        order_store,
+        order_instruments,
+        config.order_matching_batch_size,
+        [&order_repository](const simtrade::order::Execution& execution, std::uint32_t expected_version) {
+          if (!order_repository || !order_repository->record_execution(execution, expected_version)) {
+            throw std::runtime_error("execution persistence failed");
+          }
+        },
+        [&order_repository](const simtrade::order::Order& order, std::uint32_t expected_version) {
+          if (!order_repository || !order_repository->activate_stop(order.id, order.traderId, expected_version)) {
+            throw std::runtime_error("stop activation persistence failed");
+          }
+          static_cast<void>(order_repository->record_order_event(
+              "stop-activation:" + std::to_string(order.id) + ':' + std::to_string(expected_version),
+              order.id, "STOP_ACTIVATED", {{"version", expected_version + 1}}));
+        });
+    if (order_repository && order_store.healthy()) {
+      const auto recovery = matching_engine.recover(order_repository->load_active_orders());
+      std::cout << nlohmann::json({{"level", "info"},
+                                   {"event", "active_order_recovery_completed"},
+                                   {"rebuilt", recovery.rebuilt},
+                                   {"removed", recovery.removed},
+                                   {"invalid", recovery.invalid}}).dump() << std::endl;
+    }
     simtrade::market::InstrumentCatalogue catalogue(config, redis);
     simtrade::market::AlpacaMarketDataStream market_stream(config, redis);
     simtrade::market::MarketDataRestClient market_rest_client(config);
@@ -82,11 +118,20 @@ int main() {
           subscription_manager.on_connection_changed(connected);
         });
 
-    market_stream.start([&market_hub](const nlohmann::json& event) { market_hub.publish(event); });
+    market_stream.start([&market_hub, &matching_engine](const nlohmann::json& event) {
+      try {
+        static_cast<void>(matching_engine.process(event));
+      } catch (const std::exception& exception) {
+        std::cerr << nlohmann::json({{"level", "error"},
+                                     {"event", "order_matching_failed"},
+                                     {"message", exception.what()}}).dump() << std::endl;
+      }
+      market_hub.publish(event);
+    });
 
     boost::asio::io_context io(static_cast<int>(config.worker_threads));
     simtrade::api::HttpServer server(io, config, postgres, redis, catalogue, market_stream, market_hub,
-                                     subscription_manager, market_rest_client);
+                                     subscription_manager, market_rest_client, order_repository.get(), order_store);
     server.run();
     boost::asio::signal_set signals(io, SIGINT, SIGTERM);
     signals.async_wait([&](const boost::system::error_code&, int) {
@@ -104,6 +149,7 @@ int main() {
       {"threads", config.worker_threads},
       {"postgres", postgres.healthy()},
       {"redis", redis.healthy()},
+      {"order_store", order_store.healthy()},
       {"market_data_websocket", config.alpaca_data_ws_url},
       {"maximum_stream_symbols", config.alpaca_max_stream_symbols}
     }).dump() << std::endl;

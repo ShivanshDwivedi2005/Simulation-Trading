@@ -8,6 +8,8 @@
 #include "market/MarketDataHub.hpp"
 #include "market/MarketDataRestClient.hpp"
 #include "market/SubscriptionManager.hpp"
+#include "order/OrderRepository.hpp"
+#include "order/RedisOrderStore.hpp"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -24,7 +26,9 @@ class HttpServer {
              market::AlpacaMarketDataStream& market_stream,
              market::MarketDataHub& market_hub,
              market::SubscriptionManager& subscription_manager,
-             market::MarketDataRestClient& market_rest_client);
+             market::MarketDataRestClient& market_rest_client,
+             order::OrderRepository* order_repository,
+             order::RedisOrderStore& order_store);
   void run();
   void stop();
 
@@ -40,6 +44,8 @@ class HttpServer {
   market::MarketDataHub& market_hub_;
   market::SubscriptionManager& subscription_manager_;
   market::MarketDataRestClient& market_rest_client_;
+  order::OrderRepository* order_repository_;
+  order::RedisOrderStore& order_store_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 
