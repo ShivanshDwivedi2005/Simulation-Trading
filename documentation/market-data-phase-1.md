@@ -2,7 +2,7 @@
 
 ## Scope
 
-Phase 1 establishes a searchable Alpaca instrument catalogue, one shared Alpaca IEX WebSocket connection, Redis-backed latest-event caching, and selective backend-to-browser fan-out. It intentionally does not implement pinned symbols, LRU eviction, or a waiting queue.
+Phase 1 establishes a searchable 30-stock Alpaca instrument catalogue, one shared Alpaca IEX WebSocket connection, Redis-backed latest-event caching, and selective backend-to-browser fan-out.
 
 ## Runtime data flow
 
@@ -30,7 +30,7 @@ The shared Alpaca connection:
 
 ## Instrument catalogue
 
-`InstrumentCatalogue` requests active `us_equity` assets from Alpaca’s `/v2/assets` endpoint at startup and on the configured interval. Stocks and ETFs are retained with symbol, name, exchange, asset class, active, tradable, and fractionable flags. The last successful raw catalogue is cached at:
+`InstrumentCatalogue` requests active `us_equity` assets from Alpaca’s `/v2/assets` endpoint at startup and on the configured interval, then retains only the supported 30-stock universe. The selected records keep symbol, name, exchange, asset class, active, tradable, and fractionable flags. Only the selected catalogue is cached at:
 
 ```text
 market:instruments:catalogue
@@ -45,6 +45,8 @@ GET /api/v1/instruments/search?q=apple&page=1&limit=20
 ```
 
 Search is case-insensitive across symbol and company name. `page` starts at 1 and `limit` is capped at 100.
+
+The matching runtime uses two independent FIFO workers. Worker 1 owns `NVDA, AAPL, MSFT, TSLA, AMZN, GOOGL, META, AVGO, AMD, MU, ORCL, PLTR, NFLX, WMT, COST`; worker 2 owns `HD, JPM, BAC, V, MA, LLY, JNJ, UNH, ABBV, XOM, CVX, GE, CAT, BA, PG`.
 
 ## Browser WebSocket protocol
 
@@ -106,5 +108,5 @@ The `simtrade-market-data-tests` CTest target uses mocked JSON and in-memory fak
 
 - Subscription capacity is a hard limit; there is no eviction or waiting queue.
 - The dashboard consumes latest quote/trade events. Historical chart backfill remains the existing simulated chart series.
-- The catalogue is cached in Redis rather than permanently copied into PostgreSQL.
+- The selected market-data catalogue is cached in Redis; the same 30-stock tradable universe and its worker assignment are persisted in PostgreSQL.
 - A backend process owns one Alpaca stream. Running multiple backend replicas would create one stream per process and requires cross-instance coordination in a later phase.

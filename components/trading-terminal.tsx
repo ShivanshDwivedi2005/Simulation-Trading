@@ -4,19 +4,24 @@ import {
   Activity,
   AreaChart,
   Bell,
+  BookOpen,
   CandlestickChart,
+  CheckCircle2,
   ChevronDown,
   CircleDollarSign,
+  ClipboardList,
   LineChart,
   Menu,
   Pause,
   Play,
   Search,
   ShieldCheck,
+  SlidersHorizontal,
   WalletCards,
   X,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import ThemeToggle from "@/components/theme-toggle";
 
 type SymbolKey = string;
 type Candle = { timestamp?: string; time: string; sessionMinute: number; open: number; high: number; low: number; close: number; volume: number };
@@ -49,6 +54,7 @@ type Order = {
   status: "FILLED" | "ACCEPTED" | "CANCELLED";
   time: string;
 };
+type WorkspaceView = "graph" | "orderbook" | "fills" | "positions" | "audit";
 
 const fallbackInstruments: Record<SymbolKey, Instrument> = {
   AAPL: { name: "Apple Inc.", exchange: "NASDAQ", price: 227.16, change: 1.42, bid: 227.14, ask: 227.18 },
@@ -67,6 +73,13 @@ const REGULAR_SESSION_CLOSE_MINUTE = 16 * 60;
 const REGULAR_SESSION_MINUTES = REGULAR_SESSION_CLOSE_MINUTE - REGULAR_SESSION_OPEN_MINUTE;
 
 const intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1D", "1W"];
+const workspaceMenuItems = [
+  { id: "graph", label: "Graph", description: "Interactive price chart", icon: LineChart },
+  { id: "orderbook", label: "Order book", description: "Indicative market depth", icon: BookOpen },
+  { id: "fills", label: "Fill book", description: "Completed executions", icon: CheckCircle2 },
+  { id: "positions", label: "Positions", description: "Open holdings and P&L", icon: WalletCards },
+  { id: "audit", label: "Audit trail", description: "Order event history", icon: ClipboardList },
+] satisfies Array<{ id: WorkspaceView; label: string; description: string; icon: typeof LineChart }>;
 const marketDataStatuses = new Set<MarketDataStatus>([
   "CONNECTING", "LIVE", "QUEUED", "SNAPSHOT", "STALE", "UNAVAILABLE", "ERROR",
 ]);
@@ -253,35 +266,95 @@ function utcTimeLabel(timestamp: string | null) {
 
 const money = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
 const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
+const CHART_WIDTH = 960;
+const CHART_HEIGHT = 350;
+const CHART_PAD = { top: 18, right: 64, bottom: 42, left: 16 } as const;
 
 function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; chartType: string; paused: boolean; price: number }) {
   const [cursor, setCursor] = useState<{ x: number; y: number; minute: number; time: string; price: number; locked: boolean } | null>(null);
-  const candles = candlesFor(symbol, price);
-  const width = 960;
-  const height = 350;
-  const pad = { top: 18, right: 64, bottom: 42, left: 16 };
-  const values = [price, ...candles.flatMap((item) => [item.high, item.low])];
-  const min = Math.min(...values) - 0.8;
-  const max = Math.max(...values) + 0.8;
-  const innerWidth = width - pad.left - pad.right;
-  const innerHeight = height - pad.top - pad.bottom;
-  const sessionOpenMinute = candles[0]?.timestamp
-    ? regularSessionOpenUtcMinute(new Date(candles[0].timestamp))
-    : candles[0]?.sessionMinute ?? regularSessionOpenUtcMinute(new Date());
-  const sessionCloseMinute = sessionOpenMinute + REGULAR_SESSION_MINUTES;
+  const [zoom, setZoom] = useState(1);
+  const chartRef = useRef<SVGSVGElement>(null);
+  const chartShellRef = useRef<HTMLDivElement>(null);
+  const pointerFrameRef = useRef<number | null>(null);
+  const pendingPointerRef = useRef<{ clientX: number; clientY: number; target: SVGSVGElement } | null>(null);
+  const allCandles = candlesFor(symbol, price);
+  const maxZoom = Math.max(1, Math.min(16, allCandles.length / 24));
+  const visibleCount = Math.max(24, Math.ceil(allCandles.length / zoom));
+  const candles = useMemo(() => allCandles.slice(-visibleCount), [allCandles, visibleCount]);
+  const { min, max } = useMemo(() => {
+    const values = [price, ...candles.flatMap((item) => [item.high, item.low])];
+    return { min: Math.min(...values) - 0.8, max: Math.max(...values) + 0.8 };
+  }, [candles, price]);
+  const innerWidth = CHART_WIDTH - CHART_PAD.left - CHART_PAD.right;
+  const innerHeight = CHART_HEIGHT - CHART_PAD.top - CHART_PAD.bottom;
+  const sessionOpenMinute = candles[0]?.sessionMinute ?? regularSessionOpenUtcMinute(new Date());
+  const sessionCloseMinute = candles.at(-1)?.sessionMinute ?? sessionOpenMinute + REGULAR_SESSION_MINUTES;
+  const visibleSessionMinutes = Math.max(1, sessionCloseMinute - sessionOpenMinute);
   const formatSessionMinute = (minute: number) => `${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`;
-  const xForMinute = (minute: number) => pad.left + ((minute - sessionOpenMinute) / REGULAR_SESSION_MINUTES) * innerWidth;
-  const x = (index: number) => xForMinute(candles[index].sessionMinute);
-  const y = (value: number) => pad.top + ((max - value) / (max - min)) * innerHeight;
-  const points = candles.map((item, index) => `${x(index)},${y(item.close)}`).join(" ");
-  const areaPoints = `${x(0)},${height - pad.bottom} ${points} ${x(candles.length - 1)},${height - pad.bottom}`;
-  const gridValues = Array.from({ length: 5 }, (_, index) => min + ((max - min) * index) / 4).reverse();
+  const xForMinute = (minute: number) => CHART_PAD.left + ((minute - sessionOpenMinute) / visibleSessionMinutes) * innerWidth;
+  const y = (value: number) => CHART_PAD.top + ((max - value) / (max - min)) * innerHeight;
   const last = candles.at(-1)!;
-  const sessionTicks = [0, 0.25, 0.5, 0.75, 1].map((position) => sessionOpenMinute + Math.round(position * REGULAR_SESSION_MINUTES));
   const hasMarketData = marketCandleSets.has(symbol);
   const cursorPriceLabelWidth = 64;
   const cursorPriceLabelGap = 8;
-  const cursorPriceLabelX = width - pad.right - cursorPriceLabelWidth - cursorPriceLabelGap;
+  const cursorPriceLabelX = CHART_WIDTH - CHART_PAD.right - cursorPriceLabelWidth - cursorPriceLabelGap;
+
+  const chartPlot = useMemo(() => {
+    const yForValue = (value: number) => CHART_PAD.top + ((max - value) / (max - min)) * innerHeight;
+    const xForSessionMinute = (minute: number) => CHART_PAD.left + ((minute - sessionOpenMinute) / visibleSessionMinutes) * innerWidth;
+    const xForIndex = (index: number) => xForSessionMinute(candles[index].sessionMinute);
+    const points = candles.map((item, index) => `${xForIndex(index)},${yForValue(item.close)}`).join(" ");
+    const areaPoints = `${xForIndex(0)},${CHART_HEIGHT - CHART_PAD.bottom} ${points} ${xForIndex(candles.length - 1)},${CHART_HEIGHT - CHART_PAD.bottom}`;
+    const gridValues = Array.from({ length: 5 }, (_, index) => min + ((max - min) * index) / 4).reverse();
+    const sessionTicks = [0, 0.25, 0.5, 0.75, 1].map((position) => sessionOpenMinute + Math.round(position * visibleSessionMinutes));
+    const candleWidth = Math.max(1, Math.min(12, (innerWidth / visibleSessionMinutes) * 0.72));
+
+    return <>
+      {gridValues.map((value) => (
+        <g key={value}>
+          <line x1={CHART_PAD.left} x2={CHART_WIDTH - CHART_PAD.right} y1={yForValue(value)} y2={yForValue(value)} className="chart-grid" />
+          <text x={CHART_WIDTH - CHART_PAD.right + 10} y={yForValue(value) + 4} className="chart-axis">{value.toFixed(2)}</text>
+        </g>
+      ))}
+      {sessionTicks.map((minute, index) => (
+        <text key={minute} x={xForSessionMinute(minute)} y={CHART_HEIGHT - 14} textAnchor={index === 0 ? "start" : index === sessionTicks.length - 1 ? "end" : "middle"} className="chart-axis">
+          {formatSessionMinute(minute)}
+        </text>
+      ))}
+      {chartType === "Candles" && candles.map((item, index) => {
+        const rising = item.close >= item.open;
+        return (
+          <g key={`${item.time}-${index}`} className={rising ? "candle-positive" : "candle-negative"}>
+            <line x1={xForIndex(index)} x2={xForIndex(index)} y1={yForValue(item.high)} y2={yForValue(item.low)} />
+            <rect x={xForIndex(index) - candleWidth / 2} y={yForValue(Math.max(item.open, item.close))} width={candleWidth} height={Math.max(2, Math.abs(yForValue(item.open) - yForValue(item.close)))} rx="1" />
+          </g>
+        );
+      })}
+      {chartType === "Area" && <polygon points={areaPoints} fill="url(#area-fill)" />}
+      {chartType !== "Candles" && <polyline points={points} className="price-line" />}
+      <line x1={CHART_PAD.left} x2={CHART_WIDTH - CHART_PAD.right} y1={yForValue(price)} y2={yForValue(price)} className="last-price-line" />
+      <rect x={CHART_WIDTH - CHART_PAD.right} y={yForValue(price) - 11} width="58" height="22" rx="4" className="last-price-label" />
+      <text x={CHART_WIDTH - 10} y={yForValue(price) + 4} textAnchor="end" className="last-price-text">{price.toFixed(2)}</text>
+    </>;
+  }, [candles, chartType, innerHeight, innerWidth, max, min, price, sessionOpenMinute, visibleSessionMinutes]);
+
+  useEffect(() => {
+    const chartShell = chartShellRef.current;
+    if (!chartShell) return;
+    function zoomChart(event: WheelEvent) {
+      event.preventDefault();
+      event.stopPropagation();
+      const factor = Math.exp(-event.deltaY * 0.0018);
+      setZoom((current) => Math.min(maxZoom, Math.max(1, current * factor)));
+      setCursor(null);
+    }
+    chartShell.addEventListener("wheel", zoomChart, { passive: false });
+    return () => chartShell.removeEventListener("wheel", zoomChart);
+  }, [maxZoom]);
+
+  useEffect(() => () => {
+    if (pointerFrameRef.current !== null) cancelAnimationFrame(pointerFrameRef.current);
+  }, []);
 
   function cursorFromPoint(clientX: number, clientY: number, locked: boolean, target: SVGSVGElement) {
     const screenTransform = target.getScreenCTM();
@@ -289,19 +362,44 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
     const svgPoint = new DOMPoint(clientX, clientY).matrixTransform(screenTransform.inverse());
     const svgX = svgPoint.x;
     const svgY = svgPoint.y;
-    const cursorX = Math.min(width - pad.right, Math.max(pad.left, svgX));
-    const cursorY = Math.min(height - pad.bottom, Math.max(pad.top, svgY));
+    const cursorX = Math.min(CHART_WIDTH - CHART_PAD.right, Math.max(CHART_PAD.left, svgX));
+    const cursorY = Math.min(CHART_HEIGHT - CHART_PAD.bottom, Math.max(CHART_PAD.top, svgY));
     const minute = Math.min(sessionCloseMinute, Math.max(
       sessionOpenMinute,
-      Math.round(sessionOpenMinute + ((cursorX - pad.left) / innerWidth) * REGULAR_SESSION_MINUTES),
+      Math.round(sessionOpenMinute + ((cursorX - CHART_PAD.left) / innerWidth) * visibleSessionMinutes),
     ));
-    const cursorPrice = max - ((cursorY - pad.top) / innerHeight) * (max - min);
+    const cursorPrice = max - ((cursorY - CHART_PAD.top) / innerHeight) * (max - min);
     setCursor({ x: cursorX, y: cursorY, minute, time: formatSessionMinute(minute), price: cursorPrice, locked });
+  }
+
+  function scheduleCursorUpdate(clientX: number, clientY: number, target: SVGSVGElement) {
+    pendingPointerRef.current = { clientX, clientY, target };
+    if (pointerFrameRef.current !== null) return;
+    pointerFrameRef.current = requestAnimationFrame(() => {
+      pointerFrameRef.current = null;
+      const pending = pendingPointerRef.current;
+      if (pending) cursorFromPoint(pending.clientX, pending.clientY, false, pending.target);
+    });
   }
 
   function handleChartKeyDown(event: React.KeyboardEvent<SVGSVGElement>) {
     if (event.key === "Escape") {
       setCursor(null);
+      return;
+    }
+    if (["+", "="].includes(event.key)) {
+      event.preventDefault();
+      setZoom((current) => Math.min(maxZoom, current * 1.18));
+      return;
+    }
+    if (["-", "_"].includes(event.key)) {
+      event.preventDefault();
+      setZoom((current) => Math.max(1, current / 1.18));
+      return;
+    }
+    if (event.key === "0") {
+      event.preventDefault();
+      setZoom(1);
       return;
     }
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", " "].includes(event.key)) return;
@@ -323,27 +421,35 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
   }
 
   return (
-    <div className="chart-shell" aria-label={`${symbol} price chart. Last price ${money.format(price)}. ${paused ? "Live updates paused." : "Live updates active."}`}>
+    <div ref={chartShellRef} className="chart-shell" aria-label={`${symbol} price chart. Last price ${money.format(price)}. ${paused ? "Live updates paused." : "Live updates active."}`}>
       <div className="chart-context">
         <span>{hasMarketData ? "Market data" : "Simulated sample data"} · Regular session · Times shown in UTC</span>
-        <span>Move to inspect · Click to pin · Esc to clear</span>
+        <div className="chart-zoom-meta">
+          <span className="chart-zoom-hint">Scroll to zoom · {Math.round(zoom * 100)}%</span>
+          <button type="button" onClick={() => { setZoom(1); setCursor(null); }} disabled={zoom <= 1}>Reset</button>
+        </div>
       </div>
       <p className="sr-only">{symbol} intraday {chartType.toLowerCase()} chart with {candles.length} OHLC bars. Session low {money.format(min + 0.8)}, session high {money.format(max - 0.8)}. Use arrow keys to inspect time and price coordinates.</p>
       <svg
+        ref={chartRef}
         className="price-chart"
-        viewBox={`0 0 ${width} ${height}`}
+        viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT}`}
         role="img"
         tabIndex={0}
-        aria-label={`${symbol} intraday ${chartType.toLowerCase()} price chart. Interactive crosshair available.`}
+        aria-label={`${symbol} intraday ${chartType.toLowerCase()} price chart. Scroll to zoom, double-click to reset, or use plus, minus, and zero keys.`}
         aria-describedby="chart-cursor-readout"
         onPointerMove={(event) => {
-          if (!cursor?.locked) cursorFromPoint(event.clientX, event.clientY, false, event.currentTarget);
+          if (!cursor?.locked) scheduleCursorUpdate(event.clientX, event.clientY, event.currentTarget);
         }}
         onPointerDown={(event) => {
           event.currentTarget.focus();
           cursorFromPoint(event.clientX, event.clientY, true, event.currentTarget);
         }}
         onPointerLeave={() => setCursor((current) => current?.locked ? current : null)}
+        onDoubleClick={() => {
+          setZoom(1);
+          setCursor(null);
+        }}
         onKeyDown={handleChartKeyDown}
       >
         <defs>
@@ -352,40 +458,15 @@ function PriceChart({ symbol, chartType, paused, price }: { symbol: SymbolKey; c
             <stop offset="100%" stopColor="#38bdf8" stopOpacity="0" />
           </linearGradient>
         </defs>
-        {gridValues.map((value) => (
-          <g key={value}>
-            <line x1={pad.left} x2={width - pad.right} y1={y(value)} y2={y(value)} className="chart-grid" />
-            <text x={width - pad.right + 10} y={y(value) + 4} className="chart-axis">{value.toFixed(2)}</text>
-          </g>
-        ))}
-        {sessionTicks.map((minute, index) => (
-          <text key={minute} x={xForMinute(minute)} y={height - 14} textAnchor={index === 0 ? "start" : index === sessionTicks.length - 1 ? "end" : "middle"} className="chart-axis">
-            {formatSessionMinute(minute)}
-          </text>
-        ))}
-        {chartType === "Candles" && candles.map((item, index) => {
-          const rising = item.close >= item.open;
-          const candleWidth = Math.max(1, Math.min(12, (innerWidth / REGULAR_SESSION_MINUTES) * 0.72));
-          return (
-            <g key={`${item.time}-${index}`} className={rising ? "candle-positive" : "candle-negative"}>
-              <line x1={x(index)} x2={x(index)} y1={y(item.high)} y2={y(item.low)} />
-              <rect x={x(index) - candleWidth / 2} y={y(Math.max(item.open, item.close))} width={candleWidth} height={Math.max(2, Math.abs(y(item.open) - y(item.close)))} rx="1" />
-            </g>
-          );
-        })}
-        {chartType === "Area" && <polygon points={areaPoints} fill="url(#area-fill)" />}
-        {chartType !== "Candles" && <polyline points={points} className="price-line" />}
-        <line x1={pad.left} x2={width - pad.right} y1={y(price)} y2={y(price)} className="last-price-line" />
-        <rect x={width - pad.right} y={y(price) - 11} width="58" height="22" rx="4" className="last-price-label" />
-        <text x={width - 10} y={y(price) + 4} textAnchor="end" className="last-price-text">{price.toFixed(2)}</text>
+        {chartPlot}
         {cursor && <g className="chart-crosshair" aria-hidden="true">
-          <line x1={cursor.x} x2={cursor.x} y1={pad.top} y2={height - pad.bottom} />
-          <line x1={pad.left} x2={width - pad.right} y1={cursor.y} y2={cursor.y} />
+          <line x1={cursor.x} x2={cursor.x} y1={CHART_PAD.top} y2={CHART_HEIGHT - CHART_PAD.bottom} />
+          <line x1={CHART_PAD.left} x2={CHART_WIDTH - CHART_PAD.right} y1={cursor.y} y2={cursor.y} />
           <circle cx={cursor.x} cy={cursor.y} r="4" />
           <rect x={cursorPriceLabelX} y={cursor.y - 11} width={cursorPriceLabelWidth} height="22" rx="4" />
           <text x={cursorPriceLabelX + cursorPriceLabelWidth - 5} y={cursor.y + 4} textAnchor="end">{cursor.price.toFixed(2)}</text>
-          <rect x={Math.min(width - pad.right - 70, Math.max(pad.left, cursor.x - 35))} y={height - pad.bottom + 7} width="70" height="22" rx="4" />
-          <text x={Math.min(width - pad.right - 35, Math.max(pad.left + 35, cursor.x))} y={height - pad.bottom + 22} textAnchor="middle">{cursor.time} UTC</text>
+          <rect x={Math.min(CHART_WIDTH - CHART_PAD.right - 70, Math.max(CHART_PAD.left, cursor.x - 35))} y={CHART_HEIGHT - CHART_PAD.bottom + 7} width="70" height="22" rx="4" />
+          <text x={Math.min(CHART_WIDTH - CHART_PAD.right - 35, Math.max(CHART_PAD.left + 35, cursor.x))} y={CHART_HEIGHT - CHART_PAD.bottom + 22} textAnchor="middle">{cursor.time} UTC</text>
         </g>}
       </svg>
       <output id="chart-cursor-readout" className="sr-only" aria-live="polite">
@@ -423,7 +504,8 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   const [positions, setPositions] = useState<Position[]>([]);
   const [orders, setOrders] = useState<Order[]>([]);
   const [orderSubmitting, setOrderSubmitting] = useState(false);
-  const [activeTable, setActiveTable] = useState<"positions" | "orders">("positions");
+  const [activeView, setActiveView] = useState<WorkspaceView>("graph");
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
   const [paused, setPaused] = useState(false);
   const [notice, setNotice] = useState("");
   const [mobileWatchlist, setMobileWatchlist] = useState(false);
@@ -448,6 +530,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const workspaceMenuRef = useRef<HTMLDivElement>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const marketDataStatusRef = useRef<MarketDataStatus>("CONNECTING");
   const subscribedSymbolRef = useRef(symbol);
@@ -472,6 +555,17 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
         : "US equity session time in UTC";
 
   const quote = instruments[symbol];
+  const orderBookLevels = useMemo(() => ({
+    asks: Array.from({ length: 6 }, (_, index) => ({
+      price: quote.ask + index * 0.02,
+      size: 90 + ((index + 3) * 137) % 720,
+    })).reverse(),
+    bids: Array.from({ length: 6 }, (_, index) => ({
+      price: quote.bid - index * 0.02,
+      size: 110 + ((index + 5) * 113) % 680,
+    })),
+  }), [quote.ask, quote.bid]);
+  const filledOrders = useMemo(() => orders.filter((order) => order.status === "FILLED"), [orders]);
   const positionsValue = useMemo(
     () => positions.reduce((sum, position) => sum + (instruments[position.symbol]?.price ?? position.averagePrice) * position.quantity, 0),
     [instruments, positions],
@@ -482,6 +576,21 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
   );
   const equity = cash + positionsValue;
   const estimatedPrice = orderType === "MARKET" ? (side === "BUY" ? quote.ask : quote.bid) : limitPrice;
+
+  useEffect(() => {
+    function closeWorkspaceMenu(event: MouseEvent) {
+      if (!workspaceMenuRef.current?.contains(event.target as Node)) setWorkspaceMenuOpen(false);
+    }
+    function closeWorkspaceMenuWithEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") setWorkspaceMenuOpen(false);
+    }
+    document.addEventListener("pointerdown", closeWorkspaceMenu);
+    document.addEventListener("keydown", closeWorkspaceMenuWithEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeWorkspaceMenu);
+      document.removeEventListener("keydown", closeWorkspaceMenuWithEscape);
+    };
+  }, []);
 
   useEffect(() => {
     if (!notice) return;
@@ -904,7 +1013,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
         time: result.created_at ? utcTimeLabel(result.created_at) : utcTimeLabel(new Date().toISOString()),
       };
       setOrders((current) => [newOrder, ...current]);
-      setActiveTable("orders");
+      setActiveView(newOrder.status === "FILLED" ? "fills" : "audit");
 
       const portfolioResponse = await fetch(`${API_URL}/api/v1/portfolio`, { headers: { Authorization: `Bearer ${accessToken}` } });
       if (portfolioResponse.ok) {
@@ -944,11 +1053,26 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
           <div><strong>SIMTRADE</strong><span>US SIMULATION</span></div>
         </div>
         <div className="topbar-actions">
+          <div className="workspace-menu" ref={workspaceMenuRef}>
+            <button className="workspace-menu-trigger" type="button" aria-haspopup="menu" aria-expanded={workspaceMenuOpen} onClick={() => setWorkspaceMenuOpen((current) => !current)}>
+              <Menu aria-hidden="true" />
+              <span>{workspaceMenuItems.find((item) => item.id === activeView)?.label}</span>
+              <ChevronDown aria-hidden="true" />
+            </button>
+            {workspaceMenuOpen && <div className="workspace-menu-popover" role="menu" aria-label="Choose workspace feature">
+              <div className="workspace-menu-title"><SlidersHorizontal aria-hidden="true" /><span><strong>Workspace view</strong><small>Choose one feature to focus on</small></span></div>
+              {workspaceMenuItems.map((item) => {
+                const Icon = item.icon;
+                return <button key={item.id} type="button" role="menuitemradio" aria-checked={activeView === item.id} className={activeView === item.id ? "active" : ""} onClick={() => { setActiveView(item.id); setWorkspaceMenuOpen(false); }}><Icon aria-hidden="true" /><span><strong>{item.label}</strong><small>{item.description}</small></span></button>;
+              })}
+            </div>}
+          </div>
           <span className={`market-status ${marketDataTone}`} role="status" aria-atomic="true">
             <i aria-hidden="true" />
             <b>{marketData.status}{marketData.status === "QUEUED" && marketData.queuePosition ? ` · #${marketData.queuePosition}` : ""}</b>
           </span>
-          <button className="icon-button" aria-label="Notifications"><Bell aria-hidden="true" /><span className="notification-dot" /></button>
+          <ThemeToggle />
+          <button className="icon-button notification-button" aria-label="Notifications"><Bell aria-hidden="true" /><span className="notification-dot" /></button>
           <button className="account-button" onClick={onSignOut} aria-label={`Sign out ${userName}`} title="Sign out"><span>{userName.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "ST"}</span><div><strong>{userName}</strong><small>Demo account · Sign out</small></div><ChevronDown aria-hidden="true" /></button>
         </div>
       </header>
@@ -1005,7 +1129,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
             <dl className="quote-stats"><div><dt>Bid</dt><dd>{quote.bid.toFixed(2)}</dd></div><div><dt>Ask</dt><dd>{quote.ask.toFixed(2)}</dd></div><div><dt>Spread</dt><dd>{(quote.ask - quote.bid).toFixed(2)}</dd></div><div><dt>Volume</dt><dd>42.8M</dd></div></dl>
           </div>
 
-          <div className="chart-panel">
+          {activeView === "graph" && <div className="chart-panel feature-view">
             <div className="chart-toolbar">
               <div className="segmented-control" aria-label="Chart type">
                 <button className={chartType === "Candles" ? "active" : ""} onClick={() => setChartType("Candles")}><CandlestickChart aria-hidden="true" /> <span>Candles</span></button>
@@ -1022,28 +1146,39 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
               {paused && <em>Paused</em>}
             </div>
             <PriceChart key={`${symbol}-${chartType}`} symbol={symbol} chartType={chartType} paused={paused} price={quote.price} />
-          </div>
+          </div>}
 
-          <section className="activity-panel">
-            <div className="activity-tabs" role="tablist" aria-label="Account activity">
-              <button role="tab" aria-selected={activeTable === "positions"} className={activeTable === "positions" ? "active" : ""} onClick={() => setActiveTable("positions")}>Positions <span>{positions.length}</span></button>
-              <button role="tab" aria-selected={activeTable === "orders"} className={activeTable === "orders" ? "active" : ""} onClick={() => setActiveTable("orders")}>Orders <span>{orders.length}</span></button>
+          {activeView === "orderbook" && <section className="feature-panel feature-view" aria-labelledby="orderbook-title">
+            <div className="feature-panel-heading"><div><span>MARKET DEPTH</span><h2 id="orderbook-title">{symbol} order book</h2><p>Indicative simulated depth around the current bid and ask.</p></div><span className="spread-chip">Spread {money.format(quote.ask - quote.bid)}</span></div>
+            <div className="orderbook-grid">
+              <div className="orderbook-side asks"><div className="depth-heading"><strong>Ask orders</strong><span>Price / Size</span></div>{orderBookLevels.asks.map((level) => <div key={level.price} className="depth-row"><span className="depth-bar" style={{ width: `${Math.min(100, level.size / 8)}%` }} /><strong>{level.price.toFixed(2)}</strong><span>{number.format(level.size)}</span></div>)}</div>
+              <div className="orderbook-mid"><span>Mid price</span><strong>{((quote.bid + quote.ask) / 2).toFixed(2)}</strong><small>{quote.bid.toFixed(2)} bid · {quote.ask.toFixed(2)} ask</small></div>
+              <div className="orderbook-side bids"><div className="depth-heading"><strong>Bid orders</strong><span>Price / Size</span></div>{orderBookLevels.bids.map((level) => <div key={level.price} className="depth-row"><span className="depth-bar" style={{ width: `${Math.min(100, level.size / 8)}%` }} /><strong>{level.price.toFixed(2)}</strong><span>{number.format(level.size)}</span></div>)}</div>
             </div>
-            <div className="table-scroll">
-              {activeTable === "positions" ? <table>
-                <thead><tr><th>Symbol</th><th>Qty</th><th>Avg price</th><th>Last</th><th>Market value</th><th>Unrealized P&amp;L</th></tr></thead>
-                <tbody>{positions.map((position) => {
-                  const positionInstrument = instruments[position.symbol] ?? { name: position.symbol, exchange: "US", price: position.averagePrice, change: 0, bid: position.averagePrice, ask: position.averagePrice };
-                  const last = positionInstrument.price;
-                  const pnl = (last - position.averagePrice) * position.quantity;
-                  return <tr key={position.symbol}><td><strong>{position.symbol}</strong><small>{positionInstrument.name}</small></td><td>{position.quantity}</td><td>{money.format(position.averagePrice)}</td><td>{money.format(last)}</td><td>{money.format(last * position.quantity)}</td><td className={pnl >= 0 ? "positive" : "negative"}>{pnl >= 0 ? "+" : ""}{money.format(pnl)}</td></tr>;
-                })}</tbody>
-              </table> : <table>
-                <thead><tr><th>Order</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Price</th><th>Status</th><th><span className="sr-only">Actions</span></th></tr></thead>
-                <tbody>{orders.map((order) => <tr key={order.id}><td><strong>{order.id.slice(0, 8).toUpperCase()}</strong><small>{order.time}</small></td><td>{order.symbol}</td><td className={order.side === "BUY" ? "positive" : "negative"}>{order.side}</td><td>{order.type}</td><td>{order.quantity}</td><td>{money.format(order.price)}</td><td><span className={`status-badge ${order.status.toLowerCase()}`}>{order.status}</span></td><td>{order.status === "ACCEPTED" && <button className="table-action" onClick={() => void cancelOrder(order.id)}>Cancel</button>}</td></tr>)}</tbody>
-              </table>}
-            </div>
-          </section>
+          </section>}
+
+          {activeView === "fills" && <section className="feature-panel feature-view" aria-labelledby="fills-title">
+            <div className="feature-panel-heading"><div><span>EXECUTIONS</span><h2 id="fills-title">Fill book</h2><p>Completed simulated trades for this account.</p></div><span className="count-chip">{filledOrders.length} fills</span></div>
+            <div className="table-scroll"><table><thead><tr><th>Fill</th><th>Time</th><th>Symbol</th><th>Side</th><th>Type</th><th>Qty</th><th>Fill price</th><th>Value</th></tr></thead><tbody>
+              {filledOrders.map((order) => <tr key={order.id}><td><strong>{order.id.slice(0, 8).toUpperCase()}</strong></td><td>{order.time}</td><td>{order.symbol}</td><td className={order.side === "BUY" ? "positive" : "negative"}>{order.side}</td><td>{order.type}</td><td>{order.quantity}</td><td>{money.format(order.price)}</td><td>{money.format(order.price * order.quantity)}</td></tr>)}
+              {filledOrders.length === 0 && <tr><td className="empty-table" colSpan={8}>No fills yet. Completed orders will appear here.</td></tr>}
+            </tbody></table></div>
+          </section>}
+
+          {activeView === "positions" && <section className="feature-panel feature-view" aria-labelledby="positions-title">
+            <div className="feature-panel-heading"><div><span>PORTFOLIO</span><h2 id="positions-title">Open positions</h2><p>Current holdings, market value, and unrealized profit or loss.</p></div><span className="count-chip">{positions.length} positions</span></div>
+            <div className="table-scroll"><table><thead><tr><th>Symbol</th><th>Qty</th><th>Avg price</th><th>Last</th><th>Market value</th><th>Unrealized P&amp;L</th></tr></thead><tbody>{positions.map((position) => {
+              const positionInstrument = instruments[position.symbol] ?? { name: position.symbol, exchange: "US", price: position.averagePrice, change: 0, bid: position.averagePrice, ask: position.averagePrice };
+              const last = positionInstrument.price;
+              const pnl = (last - position.averagePrice) * position.quantity;
+              return <tr key={position.symbol}><td><strong>{position.symbol}</strong><small>{positionInstrument.name}</small></td><td>{position.quantity}</td><td>{money.format(position.averagePrice)}</td><td>{money.format(last)}</td><td>{money.format(last * position.quantity)}</td><td className={pnl >= 0 ? "positive" : "negative"}>{pnl >= 0 ? "+" : ""}{money.format(pnl)}</td></tr>;
+            })}{positions.length === 0 && <tr><td className="empty-table" colSpan={6}>No open positions. Filled orders will update this view.</td></tr>}</tbody></table></div>
+          </section>}
+
+          {activeView === "audit" && <section className="feature-panel feature-view" aria-labelledby="audit-title">
+            <div className="feature-panel-heading"><div><span>ACCOUNT HISTORY</span><h2 id="audit-title">Audit trail</h2><p>A chronological record of simulated order activity and pending orders.</p></div><span className="count-chip">{orders.length} events</span></div>
+            <div className="audit-list">{orders.map((order) => <article key={order.id}><span className={`audit-marker ${order.status.toLowerCase()}`} aria-hidden="true" /><div><strong>{order.side} {order.quantity} {order.symbol}</strong><p>{order.type} order {order.status.toLowerCase()} at {money.format(order.price)}.</p></div><span><time>{order.time}</time><small>{order.id.slice(0, 8).toUpperCase()}</small>{order.status === "ACCEPTED" && <button className="table-action" type="button" onClick={() => void cancelOrder(order.id)}>Cancel order</button>}</span></article>)}{orders.length === 0 && <div className="empty-feature"><ClipboardList aria-hidden="true" /><strong>No audit events yet</strong><p>Order submissions, fills, and cancellations will be recorded here.</p></div>}</div>
+          </section>}
         </section>
 
         <aside className="trade-panel">

@@ -116,6 +116,13 @@ void test_asset_parsing_and_search() {
   check(catalogue[0].symbol == "AAPL" && catalogue[0].fractionable, "asset flags are preserved");
   check(simtrade::market::search_instruments(catalogue, "apple", 1, 20).total == 1,
         "search is case-insensitive across company names");
+  const auto supported = simtrade::market::restrict_to_supported_stocks(catalogue);
+  check(supported.size() == 1 && supported[0].symbol == "AAPL",
+        "catalogue exposure is restricted to the configured 30 stocks");
+  check(simtrade::market::supported_stock_symbols.size() == 30 &&
+            simtrade::market::supported_stock_symbol(" nvda ") &&
+            !simtrade::market::supported_stock_symbol("SPY"),
+        "the fixed stock universe contains 30 normalized symbols and rejects other assets");
 }
 
 void test_registry_confirmation_and_reconnect() {

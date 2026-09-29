@@ -40,7 +40,7 @@ bool env_boolean(const char* name, bool fallback) {
 }
 
 std::vector<std::string> pinned_symbols() {
-  const auto configured = env_or("ALPACA_PINNED_SYMBOLS", "AAPL,MSFT,NVDA,AMZN,GOOGL");
+  const auto configured = env_or("ALPACA_PINNED_SYMBOLS", "NVDA,AAPL,MSFT,TSLA,AMZN");
   std::vector<std::string> symbols;
   std::set<std::string> unique;
   std::size_t start = 0;
