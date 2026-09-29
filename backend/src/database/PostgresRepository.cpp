@@ -602,6 +602,32 @@ std::optional<nlohmann::json> PostgresRepository::cancel_order(const std::string
                         {"status", rows[0]["status"].as<std::string>()}};
 }
 
+std::optional<nlohmann::json> PostgresRepository::authorize_order_cancel(
+    const std::string& access_token, const std::string& order_id) const {
+  std::scoped_lock lock(mutex_);
+  if (!healthy()) throw std::runtime_error("database_unavailable");
+  pqxx::read_transaction transaction(*connection_);
+  const auto rows = transaction.exec_params(
+      "SELECT o.order_id::text, o.id, o.trader_id, i.id AS instrument_numeric_id, i.symbol, "
+      "o.status, o.version FROM refresh_tokens r JOIN orders o ON o.user_id = r.user_id "
+      "JOIN instruments i ON i.instrument_id = o.instrument_id "
+      "WHERE r.token_hash = encode(digest($1, 'sha256'), 'hex') AND r.revoked_at IS NULL "
+      "AND r.expires_at > now() AND o.order_id = $2::uuid LIMIT 1",
+      access_token, order_id);
+  if (rows.empty()) return std::nullopt;
+  const auto status = rows[0]["status"].as<std::string>();
+  if (status != "PENDING" && status != "OPEN" && status != "PARTIALLY_FILLED") {
+    throw std::runtime_error("order_not_cancellable");
+  }
+  return nlohmann::json{{"id", rows[0]["order_id"].as<std::string>()},
+                        {"numeric_order_id", rows[0]["id"].as<long long>()},
+                        {"trader_id", rows[0]["trader_id"].as<long long>()},
+                        {"instrument_id", rows[0]["instrument_numeric_id"].as<long long>()},
+                        {"version", rows[0]["version"].as<int>()},
+                        {"symbol", rows[0]["symbol"].as<std::string>()},
+                        {"status", "CANCEL_PENDING"}};
+}
+
 std::map<std::string, std::size_t> PostgresRepository::pending_order_symbol_counts() const {
   std::scoped_lock lock(mutex_);
   if (!healthy()) throw std::runtime_error("database_unavailable");
@@ -615,6 +641,19 @@ std::map<std::string, std::size_t> PostgresRepository::pending_order_symbol_coun
     counts.emplace(row["symbol"].as<std::string>(), row["pending_count"].as<std::size_t>());
   }
   return counts;
+}
+
+std::optional<std::uint64_t> PostgresRepository::trader_id_for_token(const std::string& access_token) const {
+  std::scoped_lock lock(mutex_);
+  if (!healthy() || access_token.empty()) return std::nullopt;
+  pqxx::read_transaction transaction(*connection_);
+  const auto rows = transaction.exec_params(
+      "SELECT u.trader_id FROM refresh_tokens r JOIN users u ON u.user_id = r.user_id "
+      "WHERE r.token_hash = encode(digest($1, 'sha256'), 'hex') AND r.revoked_at IS NULL "
+      "AND r.expires_at > now() LIMIT 1",
+      access_token);
+  if (rows.empty()) return std::nullopt;
+  return static_cast<std::uint64_t>(rows[0][0].as<long long>());
 }
 
 }  // namespace simtrade::database

@@ -14,10 +14,11 @@ SubscriptionManager::SubscriptionManager(
     SymbolSubscriptionSink &upstream, SymbolValidator validator,
     std::vector<std::string> pinned_symbols, std::size_t capacity,
     std::chrono::seconds eviction_grace, std::chrono::seconds minimum_residency,
-    Clock clock)
+    Clock clock, bool dedicated_thread)
     : upstream_(upstream), validator_(std::move(validator)),
       capacity_(capacity), eviction_grace_(eviction_grace),
-      minimum_residency_(minimum_residency), clock_(std::move(clock)) {
+      minimum_residency_(minimum_residency), clock_(std::move(clock)),
+      dedicated_thread_(dedicated_thread) {
   if (capacity_ != 30)
     throw std::runtime_error("market-data capacity must be exactly 30 symbols");
   if (pinned_symbols.size() != 5)
@@ -37,7 +38,7 @@ SubscriptionManager::SubscriptionManager(
     }
   }
 
-  worker_ = std::thread([this] { run(); });
+  if (dedicated_thread_) worker_ = std::thread([this] { run(); });
   try {
     invoke_void([this, pinned_symbols = std::move(pinned_symbols)] {
       for (const auto &raw_symbol : pinned_symbols) {
@@ -194,6 +195,12 @@ void SubscriptionManager::process_queue() {
 }
 
 void SubscriptionManager::enqueue(Task task) const {
+  if (!dedicated_thread_) {
+    std::scoped_lock lock(inline_mutex_);
+    if (stopping_) throw std::runtime_error("subscription manager is stopping");
+    task();
+    return;
+  }
   {
     std::scoped_lock lock(queue_mutex_);
     if (stopping_)
@@ -228,6 +235,11 @@ void SubscriptionManager::run() {
 }
 
 void SubscriptionManager::stop() {
+  if (!dedicated_thread_) {
+    std::scoped_lock lock(inline_mutex_);
+    stopping_ = true;
+    return;
+  }
   {
     std::scoped_lock lock(queue_mutex_);
     if (stopping_)

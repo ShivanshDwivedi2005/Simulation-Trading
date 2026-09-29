@@ -20,7 +20,7 @@ class InstrumentCatalogue {
   InstrumentCatalogue(const InstrumentCatalogue&) = delete;
   InstrumentCatalogue& operator=(const InstrumentCatalogue&) = delete;
 
-  void start();
+  void start(bool background_refresh = true);
   void stop();
   [[nodiscard]] InstrumentSearchPage search(const std::string& query,
                                             std::size_t page,

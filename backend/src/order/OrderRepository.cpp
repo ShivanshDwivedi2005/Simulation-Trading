@@ -1,4 +1,5 @@
 #include "order/OrderRepository.hpp"
+#include "order/RedisStreamConsumer.hpp"
 
 #include <pqxx/pqxx>
 
@@ -62,6 +63,11 @@ std::vector<simtrade::order::Order> map_orders(const pqxx::result& rows) {
   orders.reserve(rows.size());
   for (const auto& row : rows) orders.push_back(map_order(row));
   return orders;
+}
+
+std::string event_field(const simtrade::order::StreamEvent& event, const std::string& name) {
+  const auto found = event.fields.find(name);
+  return found == event.fields.end() ? std::string{} : found->second;
 }
 
 }  // namespace
@@ -259,6 +265,77 @@ bool OrderRepository::record_order_event(const std::string& event_id, OrderId or
   const auto rows = transaction.exec_prepared("event_insert", event_id, order_id, event_type, event_data.dump());
   transaction.commit();
   return !rows.empty();
+}
+
+bool OrderRepository::persist_stream_events(const std::vector<StreamEvent>& events) {
+  if (events.empty()) return true;
+  std::scoped_lock lock(mutex_);
+  pqxx::work transaction(*connection_);
+  for (const auto& event : events) {
+    const auto event_id = event_field(event, "event_id");
+    const auto event_type = event_field(event, "event_type");
+    const auto order_value = event_field(event, "order_id");
+    if (event_id.empty() || event_type.empty() || order_value.empty()) continue;
+    const auto order_id = std::stoull(order_value);
+    nlohmann::json event_data = event.fields;
+    const auto inserted = transaction.exec_params(
+        "INSERT INTO order_events (event_id, order_id, event_type, event_data) "
+        "VALUES ($1, $2, $3, $4::jsonb) ON CONFLICT (event_id) DO NOTHING RETURNING id",
+        event_id, order_id, event_type, event_data.dump());
+    if (inserted.empty()) continue;
+
+    const auto version_value = event_field(event, "version");
+    const auto version = version_value.empty() ? 0U : static_cast<std::uint32_t>(std::stoul(version_value));
+    if (event_type == "ORDER_CANCELLED") {
+      transaction.exec_params(
+          "UPDATE orders SET status = 'CANCELLED', cancelled_at = now(), version = $2::integer, updated_at = now() "
+          "WHERE id = $1 AND version < $2::integer AND status IN ('PENDING', 'OPEN', 'PARTIALLY_FILLED')",
+          order_id, version);
+    } else if (event_type == "STOP_ACTIVATED") {
+      transaction.exec_params(
+          "UPDATE orders SET stop_activated = true, version = $2::integer, updated_at = now() "
+          "WHERE id = $1 AND version < $2::integer AND order_type IN ('STOP', 'STOP_LIMIT')",
+          order_id, version);
+    } else if (event_type == "ORDER_QUANTITY_CHANGED") {
+      transaction.exec_params(
+          "UPDATE orders SET quantity = $2::bigint, remaining_quantity = $3::bigint, "
+          "sequence_number = $4::bigint, version = $5::integer, updated_at = now() "
+          "WHERE id = $1 AND version < $5::integer",
+          order_id, std::stoll(event_field(event, "quantity")),
+          std::stoll(event_field(event, "remaining_quantity")),
+          std::stoull(event_field(event, "sequence_number")), version);
+    } else if (event_type == "ORDER_PRICE_CHANGED") {
+      transaction.exec_params(
+          "UPDATE orders SET limit_price_ticks = NULLIF($2, '')::bigint, "
+          "stop_price_ticks = NULLIF($3, '')::bigint, sequence_number = $4::bigint, "
+          "version = $5::integer, updated_at = now() WHERE id = $1 AND version < $5::integer",
+          order_id, event_field(event, "limit_price_ticks"), event_field(event, "stop_price_ticks"),
+          std::stoull(event_field(event, "sequence_number")), version);
+    } else if (event_type == "EXECUTION") {
+      const auto execution_id = event_field(event, "execution_id");
+      const auto trader_id = std::stoull(event_field(event, "trader_id"));
+      const auto instrument_id = std::stoull(event_field(event, "instrument_id"));
+      transaction.exec_params(
+          "INSERT INTO executions (execution_id, order_id, trader_id, instrument_id, execution_price_ticks, "
+          "execution_quantity, market_bid_ticks, market_ask_ticks, price_source, market_timestamp) "
+          "VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, '')::bigint, NULLIF($8, '')::bigint, $9, $10::timestamptz) "
+          "ON CONFLICT (execution_id) DO NOTHING",
+          execution_id, order_id, trader_id, instrument_id,
+          std::stoll(event_field(event, "execution_price_ticks")),
+          std::stoll(event_field(event, "filled_quantity")), event_field(event, "market_bid_ticks"),
+          event_field(event, "market_ask_ticks"), event_field(event, "price_source"),
+          event_field(event, "market_timestamp"));
+      const auto remaining = std::stoll(event_field(event, "remaining_quantity"));
+      transaction.exec_params(
+          "UPDATE orders SET remaining_quantity = $2::bigint, "
+          "status = CASE WHEN $2::bigint = 0 THEN 'FILLED' ELSE 'PARTIALLY_FILLED' END, "
+          "filled_at = CASE WHEN $2::bigint = 0 THEN now() ELSE filled_at END, "
+          "version = $3::integer, updated_at = now() WHERE id = $1 AND version < $3::integer",
+          order_id, remaining, version);
+    }
+  }
+  transaction.commit();
+  return true;
 }
 
 std::vector<Order> OrderRepository::load_active_orders() const {

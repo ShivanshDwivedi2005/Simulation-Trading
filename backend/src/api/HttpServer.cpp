@@ -302,11 +302,14 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
               market::SubscriptionManager& subscription_manager,
               market::MarketDataRestClient& market_rest_client,
               order::OrderRepository* order_repository,
-              order::RedisOrderStore& order_store)
+              order::OrderProcessingRuntime& order_runtime,
+              order::NotificationWorker& notification_worker,
+              order::PersistenceWorker& persistence_worker)
       : stream_(std::move(socket)), config_(config), postgres_(postgres), redis_(redis),
         catalogue_(catalogue), market_stream_(market_stream), market_hub_(market_hub),
         subscription_manager_(subscription_manager), market_rest_client_(market_rest_client),
-        order_repository_(order_repository), order_store_(order_store) {}
+        order_repository_(order_repository), order_runtime_(order_runtime),
+        notification_worker_(notification_worker), persistence_worker_(persistence_worker) {}
 
   void run() { read(); }
 
@@ -362,12 +365,28 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
 
     try {
       if (request_.method() == http::verb::get && (target == "/health" || target == "/ready")) {
-        const bool ready = postgres_.healthy() && redis_.healthy();
+        const auto processing = order_runtime_.health();
+        const auto notifications = notification_worker_.health();
+        const auto persistence = persistence_worker_.health();
+        const auto alpaca = market_stream_.health();
+        const bool ready = postgres_.healthy() && redis_.healthy() && processing.worker1Healthy &&
+                           processing.worker2Healthy && persistence.healthy;
         return json_response(ready ? http::status::ok : http::status::service_unavailable,
                              {{"status", ready ? "ready" : "degraded"},
                               {"services", {{"postgres", postgres_.status()}, {"redis", redis_.status()},
-                                            {"alpaca", config_.alpaca_api_key_id.empty() ? "not_configured" : "configured"},
-                                            {"smtp", smtp_configured(config_) ? "configured" : "not_configured"}}}});
+                                            {"alpaca", alpaca.connected ? "connected" : "disconnected"},
+                                            {"smtp", smtp_configured(config_) ? "configured" : "not_configured"}}},
+                              {"matchingQueue1Size", processing.matchingQueue1Size},
+                              {"matchingQueue2Size", processing.matchingQueue2Size},
+                              {"lastMarketEvent", processing.lastMarketEventMs},
+                              {"lastSuccessfulFill", processing.lastSuccessfulFillMs},
+                              {"unpersistedEventCount", persistence.pendingEvents},
+                              {"threadHealth", {{"marketData", alpaca.connected || config_.alpaca_api_key_id.empty()},
+                                                {"matching1", processing.worker1Healthy},
+                                                {"matching2", processing.worker2Healthy},
+                                                {"http", true},
+                                                {"notifications", notifications.healthy},
+                                                {"persistence", persistence.healthy}}}});
       }
 
       if (request_.method() == http::verb::post && target == "/api/v1/auth/register") {
@@ -571,7 +590,7 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
                                  {{"error", "STALE_MARKET_DATA"},
                                   {"message", "The latest market price is too old to execute or accept this order safely."}});
           }
-          const auto order = postgres_.place_order(token,
+          auto order = postgres_.place_order(token,
                                                    symbol,
                                                    side,
                                                    order_type,
@@ -591,9 +610,18 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
             if (order_repository_ == nullptr) throw std::runtime_error("order_repository_unavailable");
             const auto persisted = order_repository_->find_order(
                 static_cast<simtrade::order::OrderId>((*order).at("numeric_order_id").get<std::uint64_t>()));
-            if (!persisted || !order_store_.add_order(*persisted)) {
-              throw std::runtime_error("active_order_index_failed");
+            if (!persisted) throw std::runtime_error("active_order_not_found");
+            const auto queued = order_runtime_.route_order(
+                *persisted, "add:" + std::to_string(persisted->id) + ':' + std::to_string(persisted->version),
+                std::chrono::milliseconds(config_.order_enqueue_timeout_ms));
+            if (queued != order::EnqueueResult::Accepted) {
+              static_cast<void>(postgres_.cancel_order(token, (*order).at("id").get<std::string>()));
+              if (requires_protection) subscription_manager_.release_order(symbol);
+              return json_response(http::status::service_unavailable,
+                                   {{"error", "order_queue_overloaded"},
+                                    {"message", "The order was not accepted because processing is at capacity."}});
             }
+            (*order)["processing_status"] = "QUEUED";
           }
           if (requires_protection && ((*order).value("status", "") != "OPEN" ||
                                       (*order).value("idempotent_replay", false))) {
@@ -610,15 +638,24 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
         const auto token = bearer_token(request_);
         if (token.empty()) return json_response(http::status::unauthorized, {{"error", "missing_access_token"}});
         const auto order_id = target.substr(std::string("/api/v1/orders/").size());
-        const auto order = postgres_.cancel_order(token, order_id);
+        const auto order = postgres_.authorize_order_cancel(token, order_id);
         if (!order) return json_response(http::status::unauthorized, {{"error", "invalid_or_expired_access_token"}});
-        static_cast<void>(order_store_.cancel_order(
-            static_cast<simtrade::order::OrderId>((*order).at("numeric_order_id").get<std::uint64_t>()),
-            static_cast<simtrade::order::TraderId>((*order).at("trader_id").get<std::uint64_t>()),
-            (*order).at("previous_version").get<std::uint32_t>(),
-            "cancel:" + (*order).at("numeric_order_id").dump()));
+        const auto numeric_order_id = (*order).at("numeric_order_id").get<std::uint64_t>();
+        order::CancelOrderCommand command{
+            numeric_order_id,
+            (*order).at("trader_id").get<std::uint64_t>(),
+            (*order).at("version").get<std::uint32_t>(),
+            "cancel:" + std::to_string(numeric_order_id) + ':' + (*order).at("version").dump()};
+        const auto queued = order_runtime_.route_cancel(
+            (*order).at("instrument_id").get<std::uint32_t>(), command, command.eventId,
+            std::chrono::milliseconds(config_.order_enqueue_timeout_ms));
+        if (queued != order::EnqueueResult::Accepted) {
+          return json_response(http::status::service_unavailable,
+                               {{"error", "order_queue_overloaded"},
+                                {"message", "The cancellation was not accepted because processing is at capacity."}});
+        }
         subscription_manager_.release_order((*order)["symbol"].get<std::string>());
-        return json_response(http::status::ok, *order);
+        return json_response(http::status::accepted, *order);
       }
 
       if (request_.method() == http::verb::get && target.rfind("/api/v1/market/", 0) == 0 && target.ends_with("/quote")) {
@@ -690,7 +727,9 @@ class HttpSession : public std::enable_shared_from_this<HttpSession> {
   market::SubscriptionManager& subscription_manager_;
   market::MarketDataRestClient& market_rest_client_;
   order::OrderRepository* order_repository_;
-  order::RedisOrderStore& order_store_;
+  order::OrderProcessingRuntime& order_runtime_;
+  order::NotificationWorker& notification_worker_;
+  order::PersistenceWorker& persistence_worker_;
 };
 
 HttpServer::HttpServer(net::io_context& io,
@@ -703,10 +742,13 @@ HttpServer::HttpServer(net::io_context& io,
                        market::SubscriptionManager& subscription_manager,
                        market::MarketDataRestClient& market_rest_client,
                        order::OrderRepository* order_repository,
-                       order::RedisOrderStore& order_store)
+                       order::OrderProcessingRuntime& order_runtime,
+                       order::NotificationWorker& notification_worker,
+                       order::PersistenceWorker& persistence_worker)
     : io_(io), config_(config), postgres_(postgres), redis_(redis), catalogue_(catalogue),
       market_stream_(market_stream), market_hub_(market_hub), subscription_manager_(subscription_manager),
-      market_rest_client_(market_rest_client), order_repository_(order_repository), order_store_(order_store),
+      market_rest_client_(market_rest_client), order_repository_(order_repository), order_runtime_(order_runtime),
+      notification_worker_(notification_worker), persistence_worker_(persistence_worker),
       acceptor_(net::make_strand(io)) {
   const auto address = net::ip::make_address(config.http_host);
   const tcp::endpoint endpoint{address, config.http_port};
@@ -728,7 +770,7 @@ void HttpServer::accept() {
     if (!error) {
       std::make_shared<HttpSession>(std::move(socket), config_, postgres_, redis_, catalogue_, market_stream_,
                                     market_hub_, subscription_manager_, market_rest_client_, order_repository_,
-                                    order_store_)->run();
+                                    order_runtime_, notification_worker_, persistence_worker_)->run();
     }
     if (acceptor_.is_open()) accept();
   });

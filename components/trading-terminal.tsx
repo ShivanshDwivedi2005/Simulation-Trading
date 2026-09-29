@@ -664,6 +664,9 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
     function connect() {
       if (stopped) return;
       const socket = new WebSocket(WS_URL);
+      socket.addEventListener("open", () => {
+        socket.send(JSON.stringify({ action: "authenticate", accessToken }));
+      });
       socketRef.current = socket;
       setMarketData((current) => ({ ...current, status: "CONNECTING", message: "Connecting to Alpaca stream…", queuePosition: null }));
       socket.onopen = () => {
@@ -807,7 +810,7 @@ export default function TradingTerminal({ userName = "Trader", accessToken, onSi
       socket?.close();
       socketRef.current = null;
     };
-  }, []);
+  }, [accessToken]);
 
   useEffect(() => {
     const socket = socketRef.current;

@@ -1,5 +1,6 @@
 #include "order/Order.hpp"
 #include "order/OrderRepository.hpp"
+#include "order/RedisStreamConsumer.hpp"
 
 #include <pqxx/pqxx>
 
@@ -146,6 +147,31 @@ void test_repository(const std::string& connection_string, const Fixture& fixtur
         "persisted stop activation survives repository reloads");
   check(!repository.activate_stop(stop_order.id, stop_order.traderId, stop_order.version),
         "a stop cannot be activated twice with a stale version");
+  const auto batched_order = repository.insert_order(
+      {unique_value("batch-order-"), fixture.trader_id, fixture.instrument_id, Side::Buy,
+       OrderType::Limit, OrderStatus::Open, 15300, std::nullopt, 3});
+  StreamEvent execution_event;
+  execution_event.streamId = "1-0";
+  execution_event.fields = {{"event_id", unique_value("batch-event-")},
+                            {"event_type", "EXECUTION"},
+                            {"execution_id", unique_value("batch-execution-")},
+                            {"order_id", std::to_string(batched_order.id)},
+                            {"trader_id", std::to_string(batched_order.traderId)},
+                            {"instrument_id", std::to_string(batched_order.instrumentId)},
+                            {"filled_quantity", "2"},
+                            {"remaining_quantity", "1"},
+                            {"execution_price_ticks", "15250"},
+                            {"market_bid_ticks", "15240"},
+                            {"market_ask_ticks", "15250"},
+                            {"price_source", "mock"},
+                            {"market_timestamp", "2026-09-29T00:00:00Z"},
+                            {"execution_timestamp", "2026-09-29T00:00:00Z"},
+                            {"version", std::to_string(batched_order.version + 1)}};
+  check(repository.persist_stream_events({execution_event}), "stream events commit as one persistence batch");
+  const auto batched_result = repository.find_order(batched_order.id).value();
+  check(batched_result.remainingQuantity == 1 && batched_result.version == batched_order.version + 1,
+        "batched execution updates order state");
+  check(repository.persist_stream_events({execution_event}), "duplicate persistence batch is idempotent");
   const auto history = repository.load_trader_order_history(fixture.trader_id);
   check(history.size() >= 2 && history.front().createdAt >= history.back().createdAt,
         "trader history is returned newest first");

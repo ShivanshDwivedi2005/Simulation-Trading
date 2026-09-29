@@ -188,7 +188,7 @@ redis.call('XADD', KEYS[2], '*', 'event_id', ARGV[10] .. ':execution', 'event_ty
   'filled_quantity', tostring(filled), 'remaining_quantity', tostring(remaining),
   'execution_price_ticks', tostring(executionPrice), 'market_bid_ticks', ARGV[4],
   'market_ask_ticks', ARGV[5], 'price_source', ARGV[12], 'market_timestamp', ARGV[13],
-  'execution_timestamp', ARGV[14])
+  'execution_timestamp', ARGV[14], 'version', tostring(version))
 return {1, filled, remaining, executionPrice, version, status}
 )";
 

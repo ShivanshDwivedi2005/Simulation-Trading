@@ -69,9 +69,10 @@ namespace simtrade::order {
 
 MatchingEngine::MatchingEngine(RedisOrderStore& store, std::vector<Instrument> instruments,
                                std::size_t batch_size, ExecutionHandler execution_handler,
-                               ActivationHandler activation_handler)
+                               ActivationHandler activation_handler, std::string identifier_namespace)
     : store_(store), instruments_(std::move(instruments)), batch_size_(batch_size),
-      execution_handler_(std::move(execution_handler)), activation_handler_(std::move(activation_handler)) {
+      execution_handler_(std::move(execution_handler)), activation_handler_(std::move(activation_handler)),
+      identifier_namespace_(std::move(identifier_namespace)) {
   if (batch_size_ == 0 || batch_size_ > 1000) throw std::invalid_argument("matching batch size must be between 1 and 1000");
   for (std::size_t index = 0; index < instruments_.size(); ++index) {
     if (instruments_[index].active) instrument_indexes_.emplace(instruments_[index].symbol, index);
@@ -84,7 +85,8 @@ const Instrument* MatchingEngine::instrument_for_symbol(const std::string& symbo
 }
 
 std::string MatchingEngine::next_identifier(const std::string& prefix) {
-  return prefix + ':' + std::to_string(now_milliseconds()) + ':' +
+  return prefix + (identifier_namespace_.empty() ? std::string{} : ':' + identifier_namespace_) + ':' +
+         std::to_string(now_milliseconds()) + ':' +
          std::to_string(identifier_sequence_.fetch_add(1));
 }
 

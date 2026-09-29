@@ -96,6 +96,9 @@ Config Config::from_environment() {
       .market_data_min_residency_seconds = env_positive_integer("MARKET_DATA_MIN_RESIDENCY_SECONDS", 30),
       .order_maximum_price_age_ms = env_positive_integer("ORDER_MAXIMUM_PRICE_AGE_MS", 30000),
       .order_matching_batch_size = env_positive_integer("ORDER_MATCHING_BATCH_SIZE", 100),
+      .order_queue_capacity = env_positive_integer("ORDER_QUEUE_CAPACITY", 4096),
+      .order_enqueue_timeout_ms = env_positive_integer("ORDER_ENQUEUE_TIMEOUT_MS", 250),
+      .order_persistence_batch_size = env_positive_integer("ORDER_PERSISTENCE_BATCH_SIZE", 100),
       .smtp_host = env_or("SMTP_HOST", ""),
       .smtp_port = env_port("SMTP_PORT", 587),
       .smtp_username = env_or("SMTP_USERNAME", ""),
@@ -111,6 +114,12 @@ Config Config::from_environment() {
   }
   if (config.order_matching_batch_size > 1000) {
     throw std::runtime_error("ORDER_MATCHING_BATCH_SIZE must not exceed 1000");
+  }
+  if (config.order_queue_capacity > 100000) {
+    throw std::runtime_error("ORDER_QUEUE_CAPACITY must not exceed 100000");
+  }
+  if (config.order_persistence_batch_size > 1000) {
+    throw std::runtime_error("ORDER_PERSISTENCE_BATCH_SIZE must not exceed 1000");
   }
   return config;
 }

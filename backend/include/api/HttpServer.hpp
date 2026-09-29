@@ -9,7 +9,8 @@
 #include "market/MarketDataRestClient.hpp"
 #include "market/SubscriptionManager.hpp"
 #include "order/OrderRepository.hpp"
-#include "order/RedisOrderStore.hpp"
+#include "order/OrderEventWorkers.hpp"
+#include "order/OrderProcessingRuntime.hpp"
 
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
@@ -28,7 +29,9 @@ class HttpServer {
              market::SubscriptionManager& subscription_manager,
              market::MarketDataRestClient& market_rest_client,
              order::OrderRepository* order_repository,
-             order::RedisOrderStore& order_store);
+             order::OrderProcessingRuntime& order_runtime,
+             order::NotificationWorker& notification_worker,
+             order::PersistenceWorker& persistence_worker);
   void run();
   void stop();
 
@@ -45,7 +48,9 @@ class HttpServer {
   market::SubscriptionManager& subscription_manager_;
   market::MarketDataRestClient& market_rest_client_;
   order::OrderRepository* order_repository_;
-  order::RedisOrderStore& order_store_;
+  order::OrderProcessingRuntime& order_runtime_;
+  order::NotificationWorker& notification_worker_;
+  order::PersistenceWorker& persistence_worker_;
   boost::asio::ip::tcp::acceptor acceptor_;
 };
 
