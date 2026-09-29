@@ -7,6 +7,7 @@
 #include <hiredis/hiredis.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -82,6 +83,22 @@ void test_router_and_queue() {
   check(router.group_size(1) == 15 && router.group_size(2) == 15, "matching groups own 15 instruments each");
   for (std::uint32_t id = 1; id <= 15; ++id) check(router.group_for(id) == 1, "instrument 1-15 routing");
   for (std::uint32_t id = 16; id <= 30; ++id) check(router.group_for(id) == 2, "instrument 16-30 routing");
+
+  const std::array<std::string, 30> selected_symbols{
+      "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "AVGO", "AMD", "MU",
+      "ORCL", "PLTR", "NFLX", "WMT", "COST", "HD", "JPM", "BAC", "V", "MA",
+      "LLY", "JNJ", "UNH", "ABBV", "XOM", "CVX", "GE", "CAT", "BA", "PG"};
+  std::vector<Instrument> selected_instruments;
+  for (std::size_t index = 0; index < selected_symbols.size(); ++index) {
+    selected_instruments.push_back({static_cast<InstrumentId>(index + 1), selected_symbols[index],
+                                    selected_symbols[index], "0.01", true,
+                                    static_cast<std::uint8_t>(index < 15 ? 1 : 2)});
+  }
+  InstrumentRouter selected_router(std::move(selected_instruments));
+  for (std::size_t index = 0; index < selected_symbols.size(); ++index) {
+    check(selected_router.group_for_symbol(selected_symbols[index]) == (index < 15 ? 1 : 2),
+          "selected stock routes to its assigned matching worker");
+  }
 
   simtrade::concurrency::BoundedQueue<int> queue(1);
   check(queue.push(1, std::chrono::milliseconds(1)), "first queue item accepted");

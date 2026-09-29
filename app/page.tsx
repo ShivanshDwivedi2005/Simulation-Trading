@@ -13,6 +13,7 @@ import {
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
+import ThemeToggle from "@/components/theme-toggle";
 import { useRouter, useSearchParams } from "next/navigation";
 import { FormEvent, Suspense, useEffect, useRef, useState } from "react";
 
@@ -255,6 +256,7 @@ function HomeContent() {
             <a href="#why-simtrade">Why SimTrade</a>
           </nav>
           <div className="landing-nav-actions">
+            <ThemeToggle />
             <button className="landing-login" onClick={() => openAuth("login")}>Log in</button>
             <button className="landing-signup" onClick={() => openAuth("signup")}>Create account <ArrowRight aria-hidden="true" /></button>
           </div>

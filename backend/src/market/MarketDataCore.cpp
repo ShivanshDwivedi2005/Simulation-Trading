@@ -106,6 +106,12 @@ bool valid_symbol(const std::string& symbol) {
          });
 }
 
+bool supported_stock_symbol(const std::string& raw_symbol) {
+  const auto symbol = normalize_symbol(raw_symbol);
+  return std::any_of(supported_stock_symbols.begin(), supported_stock_symbols.end(),
+                     [&symbol](std::string_view candidate) { return candidate == std::string_view(symbol); });
+}
+
 std::vector<Instrument> parse_alpaca_assets(const nlohmann::json& assets) {
   std::vector<Instrument> instruments;
   if (!assets.is_array()) return instruments;
@@ -130,6 +136,13 @@ std::vector<Instrument> parse_alpaca_assets(const nlohmann::json& assets) {
   });
   instruments.erase(std::unique(instruments.begin(), instruments.end(), [](const Instrument& left, const Instrument& right) {
     return left.symbol == right.symbol;
+  }), instruments.end());
+  return instruments;
+}
+
+std::vector<Instrument> restrict_to_supported_stocks(std::vector<Instrument> instruments) {
+  instruments.erase(std::remove_if(instruments.begin(), instruments.end(), [](const Instrument& instrument) {
+    return !supported_stock_symbol(instrument.symbol);
   }), instruments.end());
   return instruments;
 }

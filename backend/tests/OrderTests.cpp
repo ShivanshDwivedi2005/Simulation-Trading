@@ -5,6 +5,7 @@
 #include <pqxx/pqxx>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -188,6 +189,21 @@ void test_repository(const std::string& connection_string, const Fixture& fixtur
   check(std::all_of(instruments.begin(), instruments.end(), [](const auto& instrument) {
           return instrument.id > 0 && instrument.active && (instrument.matchingGroup == 1 || instrument.matchingGroup == 2);
         }), "active instruments have numeric ids and valid matching groups");
+  const std::array<std::string_view, 15> group1{
+      "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "AVGO", "AMD", "MU",
+      "ORCL", "PLTR", "NFLX", "WMT", "COST"};
+  const std::array<std::string_view, 15> group2{
+      "HD", "JPM", "BAC", "V", "MA", "LLY", "JNJ", "UNH", "ABBV", "XOM",
+      "CVX", "GE", "CAT", "BA", "PG"};
+  const auto has_group = [&instruments](std::string_view symbol, std::uint8_t group) {
+    return std::any_of(instruments.begin(), instruments.end(), [symbol, group](const auto& instrument) {
+      return std::string_view(instrument.symbol) == symbol && instrument.matchingGroup == group;
+    });
+  };
+  check(std::all_of(group1.begin(), group1.end(), [&](auto symbol) { return has_group(symbol, 1); }),
+        "the first 15 selected stocks are assigned to matching worker one");
+  check(std::all_of(group2.begin(), group2.end(), [&](auto symbol) { return has_group(symbol, 2); }),
+        "the second 15 selected stocks are assigned to matching worker two");
 
   pqxx::connection connection(connection_string);
   pqxx::work transaction(connection);

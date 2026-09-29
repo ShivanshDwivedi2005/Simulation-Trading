@@ -155,16 +155,22 @@ std::string utc_time(std::chrono::system_clock::time_point value) {
   return output.str();
 }
 
+std::string alpaca_v2_url(std::string base_url, const std::string &path) {
+  while (!base_url.empty() && base_url.back() == '/')
+    base_url.pop_back();
+  if (base_url.ends_with("/v2"))
+    return base_url + path;
+  return base_url + "/v2" + path;
+}
+
 } // namespace
 
 MarketDataRestClient::MarketDataRestClient(const config::Config &config)
     : config_(config) {}
 
 nlohmann::json MarketDataRestClient::market_clock() {
-  auto base_url = config_.alpaca_trading_rest_url;
-  while (!base_url.empty() && base_url.back() == '/')
-    base_url.pop_back();
-  return normalize_market_clock(authenticated_get(base_url + "/v2/clock"));
+  return normalize_market_clock(authenticated_get(
+      alpaca_v2_url(config_.alpaca_trading_rest_url, "/clock")));
 }
 
 nlohmann::json MarketDataRestClient::quote(const std::string &raw_symbol) {

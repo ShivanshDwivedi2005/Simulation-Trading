@@ -51,6 +51,17 @@ nlohmann::json fetch_assets(const simtrade::config::Config& config) {
   return nlohmann::json::parse(response_body);
 }
 
+nlohmann::json select_supported_assets(const nlohmann::json& assets) {
+  nlohmann::json selected = nlohmann::json::array();
+  if (!assets.is_array()) return selected;
+  for (const auto& asset : assets) {
+    if (asset.is_object() && simtrade::market::supported_stock_symbol(asset.value("symbol", ""))) {
+      selected.push_back(asset);
+    }
+  }
+  return selected;
+}
+
 }  // namespace
 
 namespace simtrade::market {
@@ -118,9 +129,15 @@ bool InstrumentCatalogue::load_cached_catalogue() {
   const auto cached = redis_.get(catalogue_cache_key);
   if (!cached) return false;
   try {
-    const auto document = nlohmann::json::parse(*cached);
-    const auto instruments = parse_alpaca_assets(document.value("assets", nlohmann::json::array()));
-    if (instruments.empty()) return false;
+    auto document = nlohmann::json::parse(*cached);
+    const auto cached_assets = document.value("assets", nlohmann::json::array());
+    auto selected_assets = select_supported_assets(cached_assets);
+    const auto instruments = parse_alpaca_assets(selected_assets);
+    if (instruments.size() != supported_stock_symbols.size()) return false;
+    if (selected_assets.size() != cached_assets.size()) {
+      document["assets"] = std::move(selected_assets);
+      static_cast<void>(redis_.set(catalogue_cache_key, document.dump()));
+    }
     std::scoped_lock lock(mutex_);
     instruments_ = instruments;
     last_synced_at_ = document.value("cachedAt", "");
@@ -132,13 +149,16 @@ bool InstrumentCatalogue::load_cached_catalogue() {
 
 void InstrumentCatalogue::synchronize() {
   const auto raw_assets = fetch_assets(config_);
-  auto instruments = parse_alpaca_assets(raw_assets);
-  if (instruments.empty()) throw std::runtime_error("alpaca_asset_catalogue_empty");
+  auto selected_assets = select_supported_assets(raw_assets);
+  auto instruments = parse_alpaca_assets(selected_assets);
+  if (instruments.size() != supported_stock_symbols.size()) {
+    throw std::runtime_error("alpaca_supported_stock_catalogue_incomplete");
+  }
 
   const auto now = std::chrono::system_clock::now();
   const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
   const auto synced_at = std::to_string(epoch);
-  nlohmann::json cache_document{{"cachedAt", synced_at}, {"assets", raw_assets}};
+  nlohmann::json cache_document{{"cachedAt", synced_at}, {"assets", std::move(selected_assets)}};
   static_cast<void>(redis_.set(catalogue_cache_key, cache_document.dump()));
 
   std::scoped_lock lock(mutex_);

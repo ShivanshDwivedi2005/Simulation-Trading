@@ -1,11 +1,13 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <functional>
 #include <mutex>
 #include <nlohmann/json.hpp>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace simtrade::market {
@@ -63,9 +65,17 @@ struct NormalizedEvent {
 
 using CacheWriter = std::function<void(const std::string&, const std::string&)>;
 
+inline constexpr std::array<std::string_view, 30> supported_stock_symbols{
+    "NVDA", "AAPL", "MSFT", "TSLA", "AMZN", "GOOGL", "META", "AVGO", "AMD", "MU",
+    "ORCL", "PLTR", "NFLX", "WMT", "COST", "HD", "JPM", "BAC", "V", "MA",
+    "LLY", "JNJ", "UNH", "ABBV", "XOM", "CVX", "GE", "CAT", "BA", "PG",
+};
+
 [[nodiscard]] std::string normalize_symbol(std::string symbol);
 [[nodiscard]] bool valid_symbol(const std::string& symbol);
+[[nodiscard]] bool supported_stock_symbol(const std::string& symbol);
 [[nodiscard]] std::vector<Instrument> parse_alpaca_assets(const nlohmann::json& assets);
+[[nodiscard]] std::vector<Instrument> restrict_to_supported_stocks(std::vector<Instrument> instruments);
 [[nodiscard]] InstrumentSearchPage search_instruments(const std::vector<Instrument>& catalogue,
                                                       const std::string& query,
                                                       std::size_t page,
